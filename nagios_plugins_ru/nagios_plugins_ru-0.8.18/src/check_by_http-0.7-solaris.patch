@@ -1,0 +1,607 @@
+diff -ruN nagios-plugins-1.4.13/rutgers/check_by_http.c nagios-plugins-1.4.13.new/rutgers/check_by_http.c
+--- nagios-plugins-1.4.13/rutgers/check_by_http.c	1969-12-31 19:00:00.000000000 -0500
++++ nagios-plugins-1.4.13.new/rutgers/check_by_http.c	2009-03-25 15:29:42.000000000 -0400
+@@ -0,0 +1,579 @@
++/******************************************************************************
++*
++* Nagios check_by_http plugin
++*
++* License: GPL
++* Copyright (c) 1999-2006 nagios-plugins team
++*
++* Last Modified: $Date: 11-18-2008 16:36:35 +0500 (Tue, 18 Nov 2008) $
++*
++* Description:
++*
++* This file contains the check_by_http plugin
++*
++* check_by_http is a nagios plugin which retrieves a text file from a specified
++* host using http. This file contains a status state (OK,WARN,CRITICAL) and a
++* status message. This plugin will return the state and status message that is
++* listed in the text file. It also checks the last modified time of the document,
++* as reported by the HEAD content, to ensure the status is current.  If the file
++* is current it reports the status, if the file is not current it will return an
++* UNKNOWN state and a message reporting that the document is not up to date.
++*
++* This plugin only works when http is functioning correctly on the server the
++* file is hosted on, and assumes there is no network issue preventing you from
++* communicating successfully with the http server.  The server you are connecting 
++* to, can be monitored by a different plugin. If no http response is recieved
++* from the server, or an error occurs in the http connection or transmissoin
++* UNKNOWN will be returned with a message regarding the http error.
++*
++* License Information:
++*
++* This program is free software; you can redistribute it and/or modify
++* it under the terms of the GNU General Public License as published by
++* the Free Software Foundation; either version 2 of the License, or
++* (at your option) any later version.
++*
++* This program is distributed in the hope that it will be useful,
++* but WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++* GNU General Public License for more details.
++*
++* You should have received a copy of the GNU General Public License
++* along with this program; if not, write to the Free Software
++* Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++
++******************************************************************************/
++
++
++const char *progname = "check_by_http";
++const char *revision = "$Revision: 7 $";
++const char *copyright = "1999-2006";
++const char *email = "nagiosplug-devel@lists.sourceforge.net";
++
++#include <ctype.h>
++#include <math.h>
++#include <stdlib.h>
++#include "netutils.h"
++#include "common.h"
++
++#define INPUT_DELIMITER ";"
++#define HTTP_EXPECT "HTTP/1."
++
++enum {
++MAX_IPV4_HOSTLENGTH = 255,
++HTTP_PORT = 80,
++HTTPS_PORT = 443,
++MAX_PORT = 65535
++};
++
++#define my_recv(buf, len) read(sd, buf, len) 
++#define my_send(buf, len) send(sd, buf, len, 0)
++
++#define HTTP_URL "/"
++#define CRLF "\r\n"
++
++int server_port = HTTP_PORT;
++char server_expect[MAX_INPUT_BUFFER] = HTTP_EXPECT;
++char *server_address;
++char *host_name;
++char *server_url = HTTP_URL;
++int sd;
++char *http_method="GET";
++char buffer[MAX_INPUT_BUFFER]; 
++int warning_time = -1;
++int critical_time = -1;
++int specify_port = FALSE;
++int check_expire = TRUE;
++
++int check_http(void);
++int process_arguments (int, char **);
++void print_usage(void);
++void print_help(void);
++void check_document_dates(const char *);
++static time_t parse_time_string (const char *);
++
++int main(int argc, char **argv)
++{
++	int result = STATE_UNKNOWN;
++  
++        if (process_arguments (argc, argv) == ERROR) 
++           usage4 (_("Could not parse arguments"));
++        /* initialize alarm signal handling, set socket timeout, start timer */
++  	(void) signal (SIGALRM, socket_timeout_alarm_handler);
++	(void) alarm (socket_timeout);
++        result = check_http();
++	return result;
++}
++
++int check_http(void)
++{
++   int i = 0;
++   char *page;
++   char *status_line;
++   char *buf;
++   char *pos;
++   char *msg;
++   char  *body;
++   char *header;
++   char *status_code;
++   int http_status;
++   int count;
++   size_t pagesize = 0;
++   char *full_page;
++   int retvalue = 3;
++
++   if (my_tcp_connect (server_address, server_port, &sd) != STATE_OK)
++      die (STATE_UNKNOWN, _("UNKNOWN - Unable to open TCP socket\n"));
++
++   asprintf (&buf, "%s %s HTTP/1.0\r\n", http_method, server_url);
++   
++   asprintf (&buf, "%sConnection: close\r\n", buf);
++   asprintf (&buf, "%s%s", buf, CRLF);
++   my_send (buf, strlen (buf));
++   full_page = strdup("");
++   while ((i = my_recv (buffer, MAX_INPUT_BUFFER-1)) > 0) 
++   {
++      buffer[i] = '\0';
++      asprintf (&full_page, "%s%s", full_page, buffer);
++      pagesize += i;
++   }
++   if (i < 0 && errno != ECONNRESET) 
++      die (STATE_UNKNOWN, _("UNKNOWN  - Error on receive\n"));
++   if (pagesize == (size_t) 0)
++      die (STATE_UNKNOWN, _("UNKNOWN - No data received from host\n"));
++   if(sd) close(sd); 
++   body = full_page;
++   header = full_page;
++  for (body = full_page; *body; body++) {
++    if (!strncmp (body, "\n\n", 2) || !strncmp (body, "\n\r\n", 3))
++      break;
++  }
++   while ( (*body == '\n') || (*body == '\r') )
++      body++;
++   if (!strncmp(body, "OK", 2))
++      retvalue = 0;
++   else if (!strncmp(body, "WARNING",7))
++      retvalue = 1;
++   else if (!strncmp(body, "CRITICAL", 8))
++      retvalue = 2;
++   else if (!strncmp(body, "UNKNOWN", 7))
++      retvalue = 3;
++   else
++   {
++      retvalue = 3;
++      *body = '\n';
++   }
++   if ( retvalue != 3 )
++   {
++      if ( check_expire )
++      {
++         check_document_dates (header);
++      }
++      count = 0;
++      while ( *body != '\n' && *body != '\0'  && count++ < 80 )
++         putchar(*body++);
++      putchar('\n');
++      return retvalue;
++   }
++   
++   page = full_page;
++
++  
++   status_line = page;
++   page += (size_t) strcspn (page, "\r\n");
++   pos = page;
++   page += (size_t) strspn (page, "\r\n");
++   status_line[strcspn(status_line, "\r\n")] = 0;
++   strip (status_line);
++   if (!strstr (status_line, server_expect)) 
++   {
++      if (server_port == HTTP_PORT)
++      asprintf (&msg,
++                _("Invalid HTTP response received from host\n"));
++    else
++      asprintf (&msg,
++                _("Invalid HTTP response received from host on port %d\n"),
++                server_port);
++    die (STATE_UNKNOWN, "UNKNOWN - %s", msg);
++   }
++   status_code = strchr (status_line, ' ') + sizeof (char);
++   if (strspn (status_code, "1234567890") != 3)
++      die (STATE_UNKNOWN, _("UNKNOWN: Invalid Status Line (%s)\n"), status_line);
++   http_status = atoi (status_code);
++   if (http_status >= 600 || http_status < 100)
++      die (STATE_UNKNOWN, _("UNKNOWN: Invalid Status (%s)\n"), status_line);
++
++    else if (http_status >= 500)
++      die (STATE_UNKNOWN, _("UNKNOWN: %s\n"), status_line);
++
++    else if (http_status >= 400)
++      die (STATE_UNKNOWN, _("UNKNOWN: %s\n"), status_line);
++   printf("UNKNOWN - check_by_http status file format not recognized\n");
++   return retvalue;
++}
++
++void print_usage(void)
++{
++  printf (_("Usage:"));
++  printf (" %s -H <vhost> | -I <IP-address> [-u <uri>] [-p <port>]\n",progname);
++  printf ("       [-w <warn time>] [-c <critical time>] [-t <timeout>] [-n]\n");
++}
++
++int process_arguments (int argc, char **argv)
++{
++  int c = 1;
++
++  int option = 0;
++  static struct option longopts[] = {
++    STD_LONG_OPTS,
++    {"warning", required_argument, 0, 'w'},
++    {"IP-address", required_argument, 0, 'I'},
++    {"url", required_argument, 0, 'u'},
++    {"port", required_argument, 0, 'p'},
++    {"critical", required_argument, 0, 'c'},
++    {"host", required_argument, 0, 'H' },
++    {"timeout", required_argument, 0, 't' },
++    {"noexpire", no_argument, 0, 'n' },
++    {"version", no_argument, 0, 'V' },
++    {0, 0, 0, 0}
++  };
++
++  if (argc < 2)
++    return ERROR;
++
++  while (1) {
++    c = getopt_long (argc, argv, "nVhc:w:H:I:p:s:u:t:", longopts, &option);
++    if (c == -1 || c == EOF)
++      break;
++
++    switch (c) {
++    case '?': /* usage */
++      usage5 ();
++      break;
++    case 'h': /* help */
++      print_help ();
++      exit (STATE_OK);
++      break;
++    case 'V': /* version */
++      print_revision (progname, revision);
++      exit (STATE_OK);
++      break;
++    case 't': /* timeout period */
++      if (!is_intnonneg (optarg))
++        usage2 (_("Timeout interval must be a positive integer"), optarg);
++      else
++        socket_timeout = atoi (optarg);
++      break;
++    case 'c': /* critical time threshold */
++       {
++          int L = strlen(optarg);
++          if (L && optarg[L-1] == 'm')
++             critical_time = atoi (optarg) * 60;
++          else if (L && optarg[L-1] == 'h')
++             critical_time = atoi (optarg) * 60 * 60;
++          else if (L && optarg[L-1] == 'd')
++             critical_time = atoi (optarg) * 60 * 60 * 24;
++          else if (L && (optarg[L-1] == 's' || isdigit (optarg[L-1])))
++             critical_time = atoi (optarg);
++          else 
++          {
++             fprintf (stderr, "unparsable critical time: %s\n", optarg);
++             exit (STATE_WARNING);
++          }
++       }
++       break;
++    case 'w': /* warning time threshold */
++       {
++          int L = strlen(optarg);
++          if (L && optarg[L-1] == 'm')
++             warning_time = atoi (optarg) * 60;
++          else if (L && optarg[L-1] == 'h')
++             warning_time = atoi (optarg) * 60 * 60;
++          else if (L && optarg[L-1] == 'd')
++             warning_time = atoi (optarg) * 60 * 60 * 24;
++          else if (L && (optarg[L-1] == 's' || isdigit (optarg[L-1])))
++             warning_time = atoi (optarg);
++          else 
++          {
++             fprintf (stderr, "unparsable warning time: %s\n", optarg);
++             exit (STATE_WARNING);
++          }
++       }
++       break;
++    case 'n': /* do not check if file is outdated */
++      check_expire = FALSE;
++      break;
++    
++    case 'H': /* Host Name (virtual host) */
++      host_name = strdup (optarg);
++      if (strstr (optarg, ":"))
++        sscanf (optarg, "%*[^:]:%d", &server_port);
++      break;
++    case 'I': /* Server IP-address */
++      server_address = strdup (optarg);
++      break;
++    case 'u': /* URL path */
++      server_url = strdup (optarg);
++      break;
++    case 'p': /* Server port */
++      if (!is_intnonneg (optarg))
++        usage2 (_("Invalid port number"), optarg);
++      else {
++        server_port = atoi (optarg);
++      }
++      break;
++    }
++  }
++
++  c = optind;
++
++  if (server_address == NULL && c < argc)
++    server_address = strdup (argv[c++]);
++
++  if (host_name == NULL && c < argc)
++    host_name = strdup (argv[c++]);
++
++  if (server_address == NULL) {
++    if (host_name == NULL)
++      usage4 (_("You must specify a server address or host name"));
++    else
++      server_address = strdup (host_name);
++  }
++
++  if (http_method == NULL)
++    http_method = strdup ("GET");
++
++  if ( check_expire )
++  {
++     if ( critical_time == -1 || warning_time == -1 )
++        usage4(_("You must specifiy a critical and warning time or use --noexpire"));
++    if ( critical_time < warning_time )
++       usage4(_("The critical time must be greater then the warning time"));
++  }
++
++  return TRUE;
++}
++
++
++void check_document_dates (const char *headers)
++{
++  const char *s;
++  char *server_date = 0;
++  char *document_date = 0;
++
++  s = headers;
++  while (*s) {
++    const char *field = s;
++    const char *value = 0;
++
++    /* Find the end of the header field */
++    while (*s && !isspace(*s) && *s != ':')
++      s++;
++
++    /* Remember the header value, if any. */
++    if (*s == ':')
++      value = ++s;
++
++    /* Skip to the end of the header, including continuation lines. */
++    while (*s && !(*s == '\n' && (s[1] != ' ' && s[1] != '\t')))
++      s++;
++    s++;
++
++    /* Process this header. */
++    if (value && value > field+2) {
++      char *ff = (char *) malloc (value-field);
++      char *ss = ff;
++      while (field < value-1)
++        *ss++ = tolower(*field++);
++      *ss++ = 0;
++
++      if (!strcmp (ff, "date") || !strcmp (ff, "last-modified")) {
++        const char *e;
++        while (*value && isspace (*value))
++          value++;
++        for (e = value; *e && *e != '\r' && *e != '\n'; e++)
++          ;
++        ss = (char *) malloc (e - value + 1);
++        strncpy (ss, value, e - value);
++        ss[e - value] = 0;
++        if (!strcmp (ff, "date")) {
++          if (server_date) free (server_date);
++          server_date = ss;
++        } else {
++          if (document_date) free (document_date);
++          document_date = ss;
++        }
++      }
++      free (ff);
++    }
++  }
++
++  /* Done parsing the body.  Now check the dates we (hopefully) parsed.  */
++  if (!server_date || !*server_date) {
++    die (STATE_UNKNOWN, _("UNKNOWN - Server date unknown\n"));
++  } else if (!document_date || !*document_date) {
++    die (STATE_UNKNOWN, _("UNKNOWN - Document modification date unknown\n"));
++  } else {
++    time_t srv_data = parse_time_string (server_date);
++    time_t doc_data = parse_time_string (document_date);
++
++    if (srv_data <= 0) {
++      die (STATE_UNKNOWN, _("UNKNOWN - Server date \"%100s\" unparsable"), server_date);
++    } else if (doc_data <= 0) {
++      die (STATE_UNKNOWN, _("UNKNOWN - Document date \"%100s\" unparsable"), document_date);
++    } else if (doc_data > srv_data + 30) {
++      die (STATE_UNKNOWN, _("UNKNOWN - Document is %d seconds in the future\n"), (int)doc_data - (int)srv_data);
++    } else if (doc_data < srv_data - critical_time) {
++       int n = (srv_data - doc_data);
++       if (n > (60 * 60 * 24 * 2))
++         die (STATE_CRITICAL, _("CRITICAL - Last modified %.1f days ago\n"), ((float) n) / (60 * 60 * 24));
++       else
++          die (STATE_CRITICAL, _("CRITICAL - Last modified %d:%02d:%02d ago\n"), n / (60 * 60), (n / 60) % 60, n % 60);
++    } else if (doc_data < srv_data - warning_time) {
++       int n = (srv_data - doc_data);
++       if (n > (60 * 60 * 24 * 2))
++          die (STATE_WARNING, _("WARNING - Last modified %.1f days ago\n"), ((float) n) / (60 * 60 * 24));
++       else
++          die (STATE_WARNING, _("WARNING  Last modified %d:%02d:%02d ago\n"), n / (60 * 60), (n / 60) % 60, n % 60);
++    }
++    
++    free (server_date);
++    free (document_date);
++  }
++}
++
++static time_t parse_time_string (const char *string)
++{
++  struct tm tm;
++  time_t t;
++  memset (&tm, 0, sizeof(tm));
++
++  /* Like this: Tue, 25 Dec 2001 02:59:03 GMT */
++
++  if (isupper (string[0])  &&  /* Tue */
++    islower (string[1])  &&
++    islower (string[2])  &&
++    ',' ==   string[3]   &&
++    ' ' ==   string[4]   &&
++    (isdigit(string[5]) || string[5] == ' ') &&   /* 25 */
++    isdigit (string[6])  &&
++    ' ' ==   string[7]   &&
++    isupper (string[8])  &&  /* Dec */
++    islower (string[9])  &&
++    islower (string[10]) &&
++    ' ' ==   string[11]  &&
++    isdigit (string[12]) &&  /* 2001 */
++    isdigit (string[13]) &&
++    isdigit (string[14]) &&
++    isdigit (string[15]) &&
++    ' ' ==   string[16]  &&
++    isdigit (string[17]) &&  /* 02: */
++    isdigit (string[18]) &&
++    ':' ==   string[19]  &&
++    isdigit (string[20]) &&  /* 59: */
++    isdigit (string[21]) &&
++    ':' ==   string[22]  &&
++    isdigit (string[23]) &&  /* 03 */
++    isdigit (string[24]) &&
++    ' ' ==   string[25]  &&
++    'G' ==   string[26]  &&  /* GMT */
++    'M' ==   string[27]  &&  /* GMT */
++    'T' ==   string[28]) {
++
++    tm.tm_sec  = 10 * (string[23]-'0') + (string[24]-'0');
++    tm.tm_min  = 10 * (string[20]-'0') + (string[21]-'0');
++    tm.tm_hour = 10 * (string[17]-'0') + (string[18]-'0');
++    tm.tm_mday = 10 * (string[5] == ' ' ? 0 : string[5]-'0') + (string[6]-'0');
++    tm.tm_mon = (!strncmp (string+8, "Jan", 3) ? 0 :
++      !strncmp (string+8, "Feb", 3) ? 1 :
++      !strncmp (string+8, "Mar", 3) ? 2 :
++      !strncmp (string+8, "Apr", 3) ? 3 :
++      !strncmp (string+8, "May", 3) ? 4 :
++      !strncmp (string+8, "Jun", 3) ? 5 :
++      !strncmp (string+8, "Jul", 3) ? 6 :
++      !strncmp (string+8, "Aug", 3) ? 7 :
++      !strncmp (string+8, "Sep", 3) ? 8 :
++      !strncmp (string+8, "Oct", 3) ? 9 :
++      !strncmp (string+8, "Nov", 3) ? 10 :
++      !strncmp (string+8, "Dec", 3) ? 11 :
++      -1);
++    tm.tm_year = ((1000 * (string[12]-'0') +
++      100 * (string[13]-'0') +
++      10 * (string[14]-'0') +
++      (string[15]-'0'))
++      - 1900);
++
++    tm.tm_isdst = 0;  /* GMT is never in DST, right? */
++
++    if (tm.tm_mon < 0 || tm.tm_mday < 1 || tm.tm_mday > 31)
++      return 0;
++
++    /*
++    This is actually wrong: we need to subtract the local timezone
++    offset from GMT from this value.  But, that's ok in this usage,
++    because we only comparing these two GMT dates against each other,
++    so it doesn't matter what time zone we parse them in.
++    */
++
++    t = mktime (&tm);
++    if (t == (time_t) -1) t = 0;
++
++   /* if (1) {
++      const char *s = string;
++      while (*s && *s != '\r' && *s != '\n')
++      fputc (*s++, stdout);
++      printf (" ==> %lu\n", (unsigned long) t);
++    }
++   */
++    return t;
++
++  } else {
++    return 0;
++  }
++}
++
++void print_help(void)
++{
++  print_revision (progname, revision);
++
++  printf (COPYRIGHT, copyright, email);
++
++  printf ("%s\n", _("This plugin retrieves a status file stored on a http server"));
++  printf ("%s\n", _("and returns OK, WARN, or CRITICAL followed by a message based"));
++  printf ("%s\n", _("on the content of the status file"));
++  printf ("\n");
++  print_usage ();
++
++  printf (_("NOTE: One or both of -H and -I must be specified"));
++
++  printf ("\n\n");
++
++  printf (" %s\n", "Options:\n");
++  printf (" %s\n", "-h, --help");
++  printf ("    %s\n","Print detailed help screen");
++  printf (" %s\n", "-V, --version");
++  printf ("    %s\n", "Print version information");
++  printf (" %s\n", "-H, --hostname=ADDRESS");
++  printf ("    %s\n", _("Host name argument for servers using host headers (virtual host)"));
++  printf ("    %s\n", _("Append a port to include it in the header (eg: example.com:5000)"));
++  printf (" %s\n", "-I, --IP-address=ADDRESS");
++  printf ("    %s\n", _("IP address or name (use numeric address if possible to bypass DNS lookup)."));
++  printf (" %s\n", "-p, --port=INTEGER");
++  printf ("    %s", _("Port number (default: "));
++  printf ("%d)\n", HTTP_PORT);
++
++  printf (" %s\n", "-u, --url=PATH");
++  printf ("    %s\n", _("URL of status file (default: /)"));
++  printf (" %s\n", "-t, --timeout=INTEGER");
++  printf ("    %s\n", _("Seconds before connection times out (default: 10)"));
++  printf (" %s\n", "-w, --warning=SECONDS");
++  printf ("    %s\n", _("Warn if document is more than SECONDS old. The number can also be of"));
++  printf ("    %s\n", _("the form \"10m\" for minutes, \"10h\" for hours, or \"10d\" for days."));
++  printf (" %s\n", "-c, --critical=SECONDS");
++  printf ("    %s\n", _("Critical if document is more than SECONDS old. See formatting of -w"));
++  printf (" %s\n", "-n, --noexpire");
++  printf ("    %s\n", _("Modification time of document is not checked"));
++  printf("\n");
++  printf ("%s\n", _("Example: check_by_http -w 10h -c 1d www.example.com -u /~home/status -t 5"));
++
++}
+diff -ruN nagios-plugins-1.4.13/rutgers/Makefile nagios-plugins-1.4.13.new/rutgers/Makefile
+--- nagios-plugins-1.4.13/rutgers/Makefile	1969-12-31 19:00:00.000000000 -0500
++++ nagios-plugins-1.4.13.new/rutgers/Makefile	2009-03-25 18:09:16.000000000 -0400
+@@ -0,0 +1,20 @@
++NAGIOS=../plugins
++LIB=../lib
++
++CC=cc
++CFLAGS = -I.. -I../gl -I$(NAGIOS) -I/usr/local/ssl/include -I$(LIB)
++LDFLAGS = -L/usr/local/lib -lsocket -lm
++
++NETOBJS = ../plugins/netutils.o 
++BASEOBJS = ../plugins/utils.o  ../lib/utils_base.o ../lib/utils_cmd.o 
++GLOBJS = ../gl/asprintf.o ../gl/vasprintf.o ../gl/vasnprintf.o ../gl/printf-parse.o ../gl/printf-args.o  ../gl/getopt.o ../gl/getopt1.o
++
++HTTPOBJS = check_by_http.o $(NETOBJS) $(BASEOBJS) $(GLOBJS)
++
++all: check_by_http
++
++check_byhttp: $(HTTPOBJS) 
++	$(CC) $(CFLAGS) $(HTTPOBJS) $(LDFLAGS) -o $@
++
++clean:	
++	rm *.o check_by_http

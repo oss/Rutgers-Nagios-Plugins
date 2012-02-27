@@ -1,0 +1,43 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+my $bad = "";
+
+unless ($ARGV[0] && $ARGV[1] && $ARGV[2]) {
+        die "Three arguments expected";
+}
+
+unless (-r $ARGV[2]) {
+        print "IPMI SENSORS UNKNOWN - Nagios misconfigured, $ARGV[2] unreadable";
+        exit 3;
+}
+
+open IPMITOOL, "/usr/local/bin/ipmitool -H $ARGV[0] -U $ARGV[1] -f $ARGV[2] chassis status 2>&1 |" or die "ipmitool: $!";
+
+while (my $line = <IPMITOOL>)
+{
+	# Nagios can only display one output line, so don't put in newlines
+	chomp $line;
+	# "true" and "active" are bad
+	next if $line =~ /false/;
+	next if $line =~ /inactive/;
+	next if $line =~ /^System Power/;
+	next if $line =~ /^Power Restore Policy/;
+	next if $line =~ /^Last Power Event/;
+	
+	if ($bad ne "") {
+	$bad .= " | ";
+	}
+	
+	$bad .= $line;
+}
+
+if ($bad eq "") {
+	print "IPMI CHASSIS OK\n";
+	exit 0
+} else {
+	print "IPMI CHASSIS WARNING - " . $bad . "\n";
+	exit 1
+}

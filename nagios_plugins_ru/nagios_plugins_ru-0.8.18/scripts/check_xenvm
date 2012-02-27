@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# COPYRIGHT    : (c) 2006 SUSE Linux GmbH. All rights reserved.
+#
+# AUTHOR       : Axel Schmidt 
+#
+# BELONGS TO   : NLPOS/SLEPOS/Xen Nagios Integration
+#
+# DESCRIPTION  : Runs "xm list" and returns the available xen vms
+#
+# $Revision: 1.0 $
+#
+# Permission to use, copy, modify, distribute, and sell this software
+# and its documentation for any purpose is hereby granted without fee,
+# provided that the above copyright notice appear in all copies and
+# that
+# both that copyright notice and this permission notice appear in
+# supporting documentation.
+
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHOR OR SUSE BE LIABLE FOR ANY CLAIM,
+# DAMAGES
+# OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+# OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+# OR
+# THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+PARM1=$1
+WARN=$2
+PARM2=$3
+CRIT=$4
+
+if [ "$PARM2" != "-c" -o "$CRIT" == "" ]; then
+        echo "Usage: $0 -w <warning> -c <critical>"
+# Nagios exit code 3 = status UNKNOWN = orange
+
+if [ "$PARM1" != "-h" ]; then
+        exit 3
+   else
+        echo ""
+        echo " -w = Minimum Number of Xen VMs to activate a warning message."
+        echo " -c = Number of Xen VMs to activate a critical message."
+        echo " -h = This help message."
+        exit 3   
+   fi
+fi
+
+RUNNING=$(sudo /usr/sbin/xm list | awk '!/[DN]/  {print $1 }')
+NBVMS=$(echo $RUNNING | wc -w)
+HNAME=$(hostname)
+
+#echo "Xen Running =" $RUNNING
+
+if [ "$NBVMS" -le "$CRIT" ]; then
+        echo "Critical Xen VMs Usage - Total NB: $NBVMS - detected VMs: $RUNNING"
+# Nagios exit code 2 = status CRITICAL = red
+        exit 2
+        else if [ "$NBVMS" -le "$WARN" ]; then
+           echo "Warning Xen VMs Usage - Total NB: $NBVMS - detected VMs: $RUNNING"
+# Nagios exit code 1 = status WARNING = yellow
+           exit 1
+        else
+            echo "OK: Xen Hypervisor \"$HNAME\" is running Xen VMs: $RUNNING"
+# Nagios exit code 0 = status OK = green
+            exit 0
+        fi
+fi

@@ -1,0 +1,175 @@
+#!/usr/bin/perl -w --      -*- Perl -*-
+
+# boilerplate template for common perl programs
+
+use strict;
+use vars qw($pgm);
+
+($pgm = $0) =~ s|.*\/||;        # basename this program
+
+use Getopt::Std;
+use vars qw($opt_d $opt_h $opt_n $opt_p $opt_b $opt_f $opt_c $opt_t $opt_T);
+use lib "/usr/lib64/nagios/plugins";
+use utils qw(%ERRORS);
+
+my $Chostname = "ldap.nbcs.rutgers.edu";
+my $Phostname = "stanlee.rutgers.edu";
+my $basedn = "dc=rci,dc=rutgers,dc=edu";
+my $filename = "/etc/nagios/rutgers/basedn";
+my $expected_result_count = 1;
+my $threshold = 3600;
+my $timeout = 9;
+my $exitcode = 0;
+my @result;
+my @clean;
+my @dirty;
+
+#############
+# FUNCTIONS #
+#############
+
+## Print usage
+sub print_usage(){
+  print STDERR <<"EndOfUsage";
+  usage: $pgm [-d] [-h] [-n consumer hostname] [-p provider hostname] [-b basedn | -f file of basedn] [-c expected result count] [-t threshold (in seconds)] [-T timeout (in seconds)]
+  where: -d debug
+         -h help (print out this usage)
+         -n consumer hostname ($Chostname)
+         -p provider hostname ($Phostname)
+         -b basedn ($basedn)
+         -f file of basedn ($filename)
+         -c expected result count ($expected_result_count)
+         -t threshold ($threshold)
+         -T timeout ($timeout)
+EndOfUsage
+  exit -1;
+}
+
+## Print debugging info if turned on
+sub myprint($){
+  print "$_[0]\n" if $opt_d;
+}
+
+## Return max error code
+sub mymax($$){
+  my $max = $_[0];
+  if($_[1] > $_[0]){
+    $max = $_[1];
+  }
+  return $max;
+}
+
+## Clean up the results and create a "clean" array
+sub clean(@){
+  foreach my $line (@_) {
+    $line =~ s/^\s*//;
+    $line =~ s/\s*$//;
+    $line =~ s/\n//;
+    push(@clean, $line);
+  }
+}
+
+## Keep around the dirty results
+sub dirty(@){
+  foreach my $line (@_) {
+    $line =~ s/^\s*//;
+    $line =~ s/\s*$//;
+    $line =~ s/\n//;
+
+    # Did we receive "no output", perhaps provider LDAP server is to blame
+    if ($line =~ /No\s+output/i) {
+      push(@dirty, $line);
+    }
+
+    # Did the check timeout, perhaps provider LDAP server is to blame
+    if ($line =~ /Service\s+Check\s+Timed\s+Out/i) {
+      push(@dirty, $line);
+    }
+
+    # Did we receive SERVER_DOWN or TIMEOUT or ? error
+    # (i.e. something looking like:
+    # ldap.SERVER_DOWN: {'desc': "Can't contact LDAP server"}
+    # OR
+    # ldap.TIMEOUT: {'info': '', 'desc': 'Timed out'}
+    if ($line =~ /^ldap\.([A-Za-z_-]+):/) {
+      push(@dirty, $1);
+    }
+  }
+}
+
+unless (getopts('dhn:p:b:f:c:t:T:') && $#ARGV < 0) {
+  print_usage();
+}
+
+print_usage() if $opt_h;
+print_usage() if $opt_b && $opt_f;
+$basedn = $opt_b if $opt_b;
+$Chostname = $opt_n if $opt_n;
+$Phostname = $opt_p if $opt_p;
+$filename = $opt_f if $opt_f;
+$expected_result_count = $opt_c if $opt_c;
+$threshold = $opt_t if $opt_t;
+$timeout = $opt_T if $opt_T;
+
+# Does the file exist and can we read it?
+if($opt_f) {
+  if (-e "$filename" && -r "$filename"){
+    # Lets read the file line by line running sync check for each basedn
+    open(FH, "< $filename") or die("Can't open $filename: $!");
+    while(<FH>){
+      s/^#.*$//;         #replace comment line with blank line
+      next if m/^$/;     #skip blank lines
+      s/^\s*//;          #trim left
+      s/\s*$//;          #trim right
+      s/\n//;            #trim newline
+      @result = `/usr/lib64/nagios/plugins/rutgers/ldapSynchCheck.py -q -b "$_" -t $threshold -T $timeout ldap://$Phostname/ ldap://$Chostname/ 2>&1`;
+      my $tmpexitcode = $? >>8;
+      if ($tmpexitcode == 0) {
+        clean($_);
+      } else {
+        dirty(@result);
+        push(@dirty, $_);
+      }
+      $exitcode = mymax($exitcode,$tmpexitcode);
+    }
+    close(FH) or die("Can't close $filename: $!");
+  } else{
+    print "CRITICAL - $filename does not exist or is unreadable\n";
+    exit $ERRORS{"CRITICAL"};
+  }
+} else {
+  @result = `/usr/lib64/nagios/plugins/rutgers/ldapSynchCheck.py -q -b "$basedn" -t $threshold -T $timeout ldap://$Phostname/ ldap://$Chostname/ 2>&1`;
+  $exitcode = $? >>8;
+  if ($exitcode == 0) {
+    clean($basedn);
+  } else {
+    dirty(@result);
+    push(@dirty, $basedn);
+  }
+}
+
+# is the original exitcode valid? (i.e. did we get the expected results?)
+if (scalar(@clean) != $expected_result_count) {
+  $exitcode = 2;
+}
+
+# print output
+if(@dirty && @clean) {
+  print "CRITICAL - Server $Phostname unavailable: " . join(" ", @dirty) . " OTHERWISE ";
+} 
+if(@dirty && ! @clean) {
+  print "CRITICAL - Server $Phostname unavailable: " . join(" ", @dirty) . "\n"; 
+}
+if(@clean) {
+  print $expected_result_count . "/" . scalar(@clean) . " Provider and consumer exactly in SYNCH: " . join(" , ", @clean) . "\n";
+}
+
+# exit out
+for ($exitcode) {
+  /0/ && do { exit $ERRORS{"OK"}; };
+  /1/ && do { exit $ERRORS{"WARNING"}; };
+  /2/ && do { exit $ERRORS{"CRITICAL"}; };
+  exit $ERRORS{"UNKNOWN"};
+}
+
+exit -1;

@@ -1,0 +1,94 @@
+#!/usr/bin/perl
+
+# Nagios plugin for IPMI sensors status checking.
+#
+# Especially useful on Dell Poweredge servers, and others that
+# implement the Intelligent Platform Management Interface (IPMI)
+# interface.
+#
+# (C) Chris Wilson <check_ipmi@qwirx.com>, 2005-06-04
+# Released under the GNU General Public License (GPL)
+#
+# Modified to English outputs by Aaron Richton
+# <richton@nbcs.rutgers.edu>
+
+# Modified to remote by Aaron Richton
+# usage: check_ipmi_remote hostname username password-file
+
+use warnings;
+use strict;
+
+unless ($ARGV[0] && $ARGV[1] && $ARGV[2]) {
+	die "Three arguments expected";
+}
+
+unless (-r $ARGV[2]) {
+	print "IPMI SENSORS UNKNOWN - Nagios misconfigured, $ARGV[2] unreadable";
+	exit 3;	
+}
+
+open IPMI, "/usr/local/bin/ipmitool -H $ARGV[0] -U $ARGV[1] -f $ARGV[2] sdr 2>&1 |" or die "ipmitool: $!";
+
+my %found;
+my %bad;
+
+sub ipmitrim ($) {
+	my ($v) = @_;
+	$v =~ s/^ +//;
+	$v =~ s/ +$//;
+	return $v;
+}
+
+while (my $line = <IPMI>)
+{
+	chomp $line;
+	unless ($line =~ m'^(.*) \| (.*) \| (\w+)$')
+	{
+		die "Bad format in ipmitool output: $line";
+	}
+
+	my $name  = ipmitrim $1;
+	my $value = ipmitrim $2;
+	my $state = ipmitrim $3;
+	$name =~ tr| |_|;
+
+	my $counter = 1;
+	my $uname = "$name";
+	while ($found{$uname}) {
+		$uname = $name . $counter++;
+	}
+
+	next if $state eq "ns";
+
+	if ($state ne "ok") {
+		if ($state eq "nc") { $state = "noncritical"; }
+		if ($state eq "cr") { $state = "critical"; }
+		if ($state eq "nr") { $state = "nonrecoverable"; }
+		if ($state eq "uf") { $state = "unspecified fault"; }
+		$bad{$uname} = $state;
+	}
+
+	$found{$uname} = $value;
+}
+
+if (keys %bad) {
+	print "IPMI SENSORS WARNING - ";
+	my @bad;
+	foreach my $name (sort keys %bad) {
+		push @bad, "$name $bad{$name}";
+	}
+	print join(", ", @bad) . " ";
+} else {
+	print "IPMI OK - ";
+}
+
+my @out;
+
+foreach my $name (sort keys %found) {
+	next unless $name =~ m|t_amb| or $name =~ m|Temp|;
+	push @out, "$name = $found{$name}";
+}
+
+print "(" . join(", ", @out) . ")\n";
+
+if (%bad) { exit 1 } else { exit 0 }

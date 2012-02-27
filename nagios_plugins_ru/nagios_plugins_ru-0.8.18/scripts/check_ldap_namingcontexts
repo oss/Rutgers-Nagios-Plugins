@@ -1,0 +1,149 @@
+#!/usr/bin/perl -w --      -*- Perl -*-
+
+# boilerplate template for common perl programs
+
+use strict;
+use vars qw($pgm);
+
+($pgm = $0) =~ s|.*\/||;        # basename this program
+
+use Getopt::Std;
+use vars qw($opt_d $opt_h $opt_n $opt_p $opt_b $opt_c $opt_f);
+use lib "/usr/lib64/nagios/plugins";
+use utils qw(%ERRORS);
+
+my $hostname = "ldap.nbcs.rutgers.edu";
+my $port = 636;
+my $filename = "/etc/nagios/rutgers/basedn";
+my $expected_result_count = 1;
+my $exitcode = 0;
+my $basedn = "";
+my @result;
+my @clean;
+my @dirty;
+
+#############
+# FUNCTIONS #
+#############
+
+## Print usage
+sub print_usage(){
+  print STDERR <<"EndOfUsage";
+  usage: $pgm [-d] [-h] [-n hostname] [-p port] [-b basedn | -f file of basedn] [-c expected result count]
+  where: -d debug
+         -h help (print out this usage)
+         -n hostname ($hostname)
+         -p port ($port)
+         -b basedn
+         -f file of basedn ($filename)
+         -c expected result count ($expected_result_count)
+EndOfUsage
+  exit -1;
+}
+
+## Print debugging info if turned on
+sub myprint($){
+  print "$_[0]\n" if $opt_d;
+}
+
+## Return max error code
+sub mymax($$){
+  my $max = $_[0];
+  if($_[1] > $_[0]){
+    $max = $_[1];
+  }
+  return $max;
+}
+
+## Clean up the results and create a "clean" array
+sub clean(@){
+  foreach my $line (@_) {
+    if ($line =~ /^namingContexts:/) {
+      $line =~ s/^namingContexts:\s*//i;
+      $line =~ s/^\s*//;
+      $line =~ s/\s*$//;
+      $line =~ s/\n//;
+      push(@clean, $line);
+    }
+  }
+}
+
+## Keep around the dirty results
+sub dirty(@){
+  foreach my $line (@_) {
+    $line =~ s/^\s*//;
+    $line =~ s/\s*$//;
+    $line =~ s/\n//;
+    push(@dirty, $line);
+  }
+}
+
+unless (getopts('dhn:p:b:f:c:') && $#ARGV < 0) {
+  print_usage();
+}
+
+print_usage() if $opt_h;
+print_usage() if $opt_b && $opt_f;
+$basedn = $opt_b if $opt_b;
+$hostname = $opt_n if $opt_n;
+$port = $opt_p if $opt_p;
+$filename = $opt_f if $opt_f;
+$expected_result_count = $opt_c if $opt_c;
+
+# Does the file exist and can we read it?
+if($opt_f) {
+  if (-e "$filename" && -r "$filename"){
+    # Lets read the file line by line searching ldap for each basedn
+    open(FH, "< $filename") or die("Can't open $filename: $!");
+    while(<FH>){
+      s/^#.*$//;      #replace comment line with blank line
+      next if m/^$/;  #skip blank lines
+      @result = `/usr/local/bin/ldapsearch -x -LLL -H ldaps://$hostname:$port/ -s base -b "$_" namingContexts 2>&1`;
+      my $tmpexitcode = $? >>8;
+      if ($tmpexitcode == 0) {
+        clean(@result);
+      } else {
+        dirty(@result, $_);
+      }
+      $exitcode = mymax($exitcode,$tmpexitcode);
+    }
+    close(FH) or die("Can't close $filename: $!");
+  } else{
+    print "CRITICAL - $filename does not exist or is unreadable\n";
+    exit $ERRORS{"CRITICAL"};
+  }
+} else {
+  @result = `/usr/local/bin/ldapsearch -x -LLL -H ldaps://$hostname:$port/ -s base -b "$basedn" namingContexts 2>&1`;
+  $exitcode = $? >>8;
+  if ($exitcode == 0) {
+    clean(@result);
+  } else {
+    dirty(@result, $basedn);
+  }
+}
+
+# is the original exitcode valid? (i.e. did we get the expected results?)
+if (scalar(@clean) != $expected_result_count) {
+  $exitcode = 2;
+}
+
+# print output
+if(@dirty && @clean) {
+  print "CRITICAL - " . join(" ", @dirty) . " OTHERWISE ";
+} 
+if(@dirty && ! @clean) {
+  print "CRITICAL - " . join(" ", @dirty) . "\n"; 
+}
+if(@clean) {
+  print $expected_result_count . "/" . scalar(@clean) . " dn: namingContexts: " . join(" , ", @clean) . "\n";
+}
+
+# exit out
+for ($exitcode) {
+  /0/ && do { exit $ERRORS{"OK"}; };
+  /1/ && do { exit $ERRORS{"WARNING"}; };
+  /2/ && do { exit $ERRORS{"CRITICAL"}; };
+  exit $ERRORS{"UNKNOWN"};
+}
+
+exit -1;

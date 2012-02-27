@@ -1,0 +1,878 @@
+#! /bin/bash 
+#
+# check_clamav update checker plugin for Nagios
+# Written by David Diffenbaugh <davediff@nbcs.rutgers.edu>
+# Last Modified 2/25/09 
+# version: 2.0.7
+# Usage: ./check_clamav -w <mins> -c <mins> [-f filepath] [-L clampath] [-S check_clampath] [-t <secs>] [-v]
+#
+# Options:
+#  -h, --help
+#      Print detailed help screen
+#   -V, --version
+#      Print version information
+#   -t, --timeout=INTEGER
+#      Seconds before plugin times out (default: 10)
+#   -v, --verbose
+#      Show details for command-line debugging
+#   -w, --warning=INTEGER
+#      Generate warning state if ClamAV Database out of date by INTEGER
+#   -c, --critical=INTEGER
+#      Generate critical state if ClamAV Database out of date by INTEGER
+#   -H, --host=HOSTNAME"
+#      Set hostname of the of ClamAV DNS server (default: current.cvd.clamav.net)
+#   -f, --filepath=PATH
+#      PATH to write state file (default: /var/log/nagios)
+#   -L, --clampath=PATH
+#      PATH to daily and main ClamAV databases (default: /var/lib/clamav)
+#   -S, --check_clampath=PATH
+#      PATH to check_clamav script (default: /usr/lib64/nagios/plugins/rutgers)
+#   -a, --addtopath=PATH
+#      add PATH to this scripts $PATH variable (i.e. /usr/local/bin)
+#
+# Description:
+# 
+# This plugin will check the installed versions of the daily and main clamav 
+# databases. The plugin compares these values with the most current
+# versions advertised by current.cvd.clamav.net. When it detects an outdated 
+# version it writes the outdated version to a state file (either 
+# clamav-outdated-daily or clamav-outdated-main). It also writes to the file 
+# the time the file is created. If the file exists for critical_threshold
+# or warning_threshold minutes the plugin will return a CRITICAL or WARNING
+# state to nagios.
+#
+# Examples:
+#
+# Check for updates and set the warning threshhold to 1080 minutes (18 hours)
+# and set the critical threshold to 1440 minutes (24 hours)
+
+# ./check_clamav -w 1080 -c 1440 -f /var/log/nagios -L /var/lib/clamav
+#
+
+# Note:
+# 
+# This script is meant to be run at a regular interval small in comparison 
+# to the critical and warning thresholds. If the script is run only once or 
+# infrequently it may never detect an out of date version. The reason for this
+# is because of what the script is reporting. It reports critical or warning 
+# only when it detects a certain period of time has elapsed since it *first*
+# detected that an update was available for clamav but that update had not
+# been applied. For example even if your clamav is 2 months out of date, and 
+# your critical threshold is 24 hours, the script will not return a critical 
+# state the first time it is run. However, you can set your critical or warning
+# thresholds to 0 and this will give the desired status as soon as you become 
+# out of date.
+#
+# Requires: bash perl sed tr cat grep cut clamav >= 0.93
+
+VERSION="2.0.7"
+progname="check_clamav"
+dnshost=current.cvd.clamav.net
+ARGS=$*
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+timeout=10
+badarg=0
+onearg=0
+verbose=0
+child=0
+outdated_daily_time=0
+outdated_main_time=0
+exit_status=0
+status_message="Clamav OK"
+#set default paths
+pathtofile="/var/log/nagios"
+pathtoclamlib="/var/lib/clamav"
+pathtoscript="/usr/lib64/nagios/plugins/rutgers"
+#FIXME should have options for paths to sigtool, host, perl, grep, sed, cat, tr, clamd
+
+usage() { 
+   echo "Usage: $progname -w <mins> -c <mins> [-f filepath] [-L clamlib] [-S check_clampath] [-t <secs>] [-v]"
+   echo "Options:"
+   echo " -h, --help"
+   echo "    Print detailed help screen"
+   echo " -V, --version"
+   echo "    Print version information"
+   echo " -t, --timeout=INTEGER"
+   echo "    Seconds before plugin times out (default: 10)"
+   echo " -v, --verbose"
+   echo "    Show details for command-line debugging"
+   echo " -w, --warning=INTEGER"
+   echo "    Generate warning state if ClamAV Database out of date by INTEGER"
+   echo " -c, --critical=INTEGER"
+   echo "    Generate critical state if ClamAV Database out of date by INTEGER"
+   echo " -H, --host=HOSTNAME"
+   echo "    Set hostname of the of ClamAV DNS server (default: current.cvd.clamav.net)"
+   echo " -f, --filepath=PATH"
+   echo "    PATH to write state file (default: /var/log/nagios)"
+   echo " -L, --clampath=PATH"
+   echo "    PATH to daily and main ClamAV databases (default: /var/lib/clamav)"
+   echo " -S, --check_clampath=PATH"
+   echo "    PATH to $progname script (default: /usr/lib64/nagios/plugins/rutgers)"
+   echo " -a, --addtopath=PATH"
+   echo "    add PATH to this scripts \$PATH variable (i.e. /usr/local/bin)"
+   echo
+   echo "Example:"
+   echo " $progname -w 1080 -c 1440 -f /var/log/nagios -L /var/lib/clamav"
+}
+
+help() {
+    version 
+    echo
+    about
+    echo
+    usage
+    echo 
+}
+
+version() {
+   echo "$progname nagios plugin version: $VERSION"
+   echo "Written by David Diffenbaugh <davediff@nbcs.rutgers.edu>"
+}
+
+about()  {
+   echo "This plugin will check the installed versions of the daily and main clamav
+databases. The plugin compares these values with the most current versions
+advertised by $dnshost. When it detects an outdated version it 
+writes the outdated version to a state file (either clamv-outdated-daily or 
+clamav-outdated-main). If this file exits unmodified for critical_thresh or
+warning_thresh minutes the plugin will return a CRITICAL or WARNING state to
+nagios."
+}
+
+
+if [ $# -lt 1 ]; then
+    usage
+    exit $STATE_CRITICAL
+fi
+
+if [ $# -eq 1 ]; then
+   onearg=1
+fi
+
+#get the command line args
+while test -n "$1"; do
+    case "$1" in
+        --help)
+	    if [ $onearg -eq 1 ]; then
+               help
+               exit $STATE_OK
+	    fi
+            ;;
+        -h)
+            if [ $onearg -eq 1 ]; then
+               help
+               exit $STATE_OK
+            fi
+            ;;
+        --version)
+            if [ $onearg -eq 1 ]; then
+               version
+               exit $STATE_OK
+            fi
+            ;;
+        -V)
+            if [ $onearg -eq 1 ]; then
+               version
+               exit $STATE_OK
+            fi
+            ;;
+        -w)
+	    if [ "`echo $2 | sed -e 's/^\(.\).*/\1/'`" == '-' ]; then
+               echo "$progname: -w option requires an integer argument"
+               badarg=1             
+            else
+               warning_threshold=$2
+	       ck=$( echo "$warning_threshold" | tr -dc '[:digit:]')
+               if [[ ${#warning_threshold} -ne ${#ck} || ${#warning_threshold} -eq 0 ]]; then
+                  echo "$progname: -w option requires an integer argument"
+                  badarg=1 
+               fi
+               shift
+            fi
+            ;;
+	--warning*)
+            warning_threshold=`echo $1 | sed -e 's/--warning=//'`
+            ck=$( echo "$warning_threshold" | tr -dc '[:digit:]')
+            if [[ ${#warning_threshold} -ne ${#ck} || ${#warning_threshold} -eq 0 ]]; then
+               echo "$progname: --warning option requires an integer value"
+               badarg=1
+            fi
+	    ;;
+        -c)
+            if [ "`echo $2 | sed -e 's/^\(.\).*/\1/'`" == '-' ]; then
+               echo "$progname: -c option requires an integer argument"
+               badarg=1
+            else
+               critical_threshold=$2
+               ck=$( echo "$critical_threshold" | tr -dc '[:digit:]')
+               if [[ ${#critical_threshold} -ne ${#ck} || ${#critical_threshold} -eq 0 ]]; then
+                  echo "$progname: -c option requires an integer argument"
+                  badarg=1
+               fi
+               shift
+            fi
+            ;;
+        --critical*)
+            critical_threshold=`echo $1 | sed -e 's/--critical=//'`
+            ck=$( echo "$critical_threshold" | tr -dc '[:digit:]')
+            if [[ ${#critical_threshold} -ne ${#ck} || ${#critical_threshold} -eq 0 ]]; then
+               echo "$progname: --critical option requires an integer value"
+               badarg=1
+            fi
+            ;;
+        -H)
+            if [ "`echo $2 | sed -e 's/^\(.\).*/\1/'`" == '-' ]; then
+               echo "$progname: -H option requires a valid hostname as an argument"
+               badarg=1
+            else
+               dnshost=$2
+               shift
+            fi
+            ;;
+        --host*)
+            dnshost=`echo $1 | sed -e 's/--host=//'`
+            ;;
+        -L)
+            if [ "`echo $2 | sed -e 's/^\(.\).*/\1/'`" == '-' ]; then
+               echo "$progname: -L option requires a valid path as an argument"
+               badarg=1
+            else
+               pathtoclamlib=$2
+               if [ ! -d "$pathtoclamlib" ]; then
+                  echo "$progname: -L option requires a valid path as an argument"
+                  badarg=1
+               fi
+               shift
+            fi
+            ;;
+        --clampath*)
+            pathtoclamlib=`echo $1 | sed -e 's/--clampath=//'`
+            if [ ! -d "$pathtoclamlib" ]; then
+               echo "$progname: --clampath option requires a valid path"
+               badarg=1
+            fi
+            ;;
+        -f)
+            if [ "`echo $2 | sed -e 's/^\(.\).*/\1/'`" == '-' ]; then
+               echo "$progname: -f option requires a valid path as an argument"
+               badarg=1
+            else
+               pathtofile=$2
+               if [ ! -d "$pathtofile" ]; then
+                  echo "$progname: -f option requires a valid path as an argument" 
+                  badarg=1
+               fi
+               shift
+            fi
+            ;;
+        --filepath*)
+            pathtofile=`echo $1 | sed -e 's/--filepath=//'`
+            if [ ! -d "$pathtofile" ]; then
+               echo "$progname: --filepath option requires a valid path"
+               badarg=1
+            fi
+            ;;
+        --verbose)
+            verbose=1
+            ;; 
+        --child)
+            child=1
+            ;;
+        -v)
+            verbose=1
+            ;;
+        -t)
+            if [ "`echo $2 | sed -e 's/^\(.\).*/\1/'`" == '-' ]; then
+               echo "$progname: -t option requires an integer argument"
+               badarg=1
+            else
+               timeout=$2
+               ck=$( echo "$timeout" | tr -dc '[:digit:]')
+               if [[ ${#timeout} -ne ${#ck} || ${#timeout} -eq 0 ]]; then
+                  echo "$progname: -t option requires an integer argument"
+                  badarg=1
+               fi
+               shift
+            fi
+            ;;
+        --timeout*)
+            timeout=`echo $1 | sed -e 's/--timeout=//'`
+            ck=$( echo "$timeout" | tr -dc '[:digit:]')
+	    if [[ ${#timeout} -ne ${#ck} || ${#timeout} -eq 0 ]]; then
+               echo "$progname: --timeout option requires an integer value"
+               badarg=1
+	    fi
+            ;;
+	-S)
+            if [ "`echo $2 | sed -e 's/^\(.\).*/\1/'`" == '-' ]; then
+               echo "$progname: -S option requires a valid path as an argument "
+               badarg=1
+            else
+	       pathtoscript=$2
+               if [ ! -d "$pathtoscript" ]; then
+                  echo "$progname: -S option requires a valid path as an argument"
+                  badarg=1
+               fi
+	       shift
+            fi
+            ;;
+        --check_clampath*)
+            pathtoscript=`echo $1 | sed -e 's/--check_clampath=//'`
+            if [ ! -d "$pathtoscript" ]; then
+               echo "$progname: --check_clampath option requires a valid path"
+               badarg=1
+            fi
+            ;;
+	-a)
+	    if [ "`echo $2 | sed -e 's/^\(.\).*/\1/'`" == '-' ]; then
+               echo "$progname: -a option requires a valid path as an argument"
+               badarg=1
+            else
+               if [ ! -d "$2" ]; then
+                  echo "$progname: -a option requires a valid path as an argument"
+                  badarg=1
+               fi
+	       path=`echo $PATH | egrep '(^|:)'$2'(:|$)'`
+	       if [ "$path" == "" ]; then
+	       PATH=$PATH:$2
+	       fi
+               shift
+            fi
+            ;;
+        --addtopath*)
+            addtopath=`echo $1 | sed -e 's/--addtopath=//'`
+            if [ ! -d "$addtopath" ]; then
+               echo "$progname: --addtopath option requires a valid path"
+               badarg=1
+	    else
+		path=`echo $PATH | egrep '(^|:)'$addtopath'(:|$)'`
+		if [ "$path" == "" ]; then
+		PATH=$PATH:$addtopath
+		fi
+	    fi
+            ;;
+        *)
+            echo "$progname: Unknown argument: $1"
+            badarg=1
+            ;;
+    esac
+    shift
+done
+
+if [ "$warning_threshold" == "" -o "$critical_threshold" == "" ]; then
+   echo "$progname: missing arguments you must specifiy both -c and -w options"
+   badarg=1
+fi
+
+if [ $badarg -eq 1 ]; then
+   echo "$progname: Try $progname --help for usage"
+   exit $STATE_UNKNOWN
+fi
+
+#after assigning arguments check that if defaults were used they exist
+
+if [ ! -d "$pathtoscript" ]; then
+   echo "ClamAV UNKNOWN - $progname: default $progname script path /usr/lib64/nagios/plugins/rutgers does not exist"
+   exit $STATE_UNKNOWN
+fi
+
+if [ ! -d "$pathtofile" ]; then
+   echo "ClamAV UNKNOWN - $progname: default file path /var/log/nagios does not exist"
+   exit $STATE_UNKNOWN
+fi
+
+if [ ! -d "$pathtoclamlib" ]; then
+   echo "ClamAV UNKNOWN - $progname: default ClamAV library path /var/lib/clamav does not exist"
+   exit $STATE_UNKNOWN
+fi
+
+
+#PARENT CODE BELOW
+if [ "$child" -eq 0 ]
+then
+   if [ "$timeout" -gt 0 ]; then
+      PARENT=$$;
+      #the below warrants some explanation, first notice that the entire command is launched in the background 
+      #sleep $timeout - self explanatory, after the time is up we need to check a few things before killing the child
+      #get the currently running child's pid from the file check_clamav.pid, if it doesn't exist then exit
+      #kill -0 $PARENT make sure this parent process is still waiting on the child, 
+      #if not then it is another child's pid so exit
+      #kill $HUNGPID - if we make it this far then try to kill the child
+      #note: if the child pid has not yet been written to the pid file when the below times out, the timeout has no effect
+      #note: a pid file is used because pgrep might give the wrong pid for the child since there might be multiple processes
+      sleep $timeout && HUNGPID=`cat ${pathtofile}/check_clamav.pid 2> /dev/null` && kill -0 $PARENT 2>/dev/null && kill $HUNGPID 2>/dev/null &
+   fi
+   ${pathtoscript}/$progname $ARGS --child
+   exit_status=$?
+   # need to check if the above process was killed
+   if [ $exit_status -eq 143 ]; then
+      echo "ClamAV UNKNOWN - $progname: timed out"
+      rm ${pathtofile}/check_clamav.pid 2>/dev/null
+      exit $STATE_UNKNOWN
+   fi
+   rm ${pathtofile}/check_clamav.pid 2>/dev/null
+   exit $exit_status
+fi
+#END PARENT CODE
+
+#CHILD CODE BELOW
+#Write pid of child process to file so it can be killed if timeout occurs, see above
+echo $$ 2>/dev/null > ${pathtofile}/check_clamav.pid 
+if [ $? -ne 0 ]; then
+   echo "ClamAV UNKNOWN - $progname: could not write PID to $pathtofile/check_clamav.pid"
+   exit $STATE_UNKNOWN
+fi
+
+#check that clamd is actually running
+if [ "`pgrep clamd`" == "" ]; then
+      echo "ClamAV CRITICAL - clamd is not running"
+      exit $STATE_CRITICAL
+fi
+
+#get installed daily version
+if [ -e ${pathtoclamlib}/daily.cld ]
+then
+   installed_daily_version_output=`sigtool -i ${pathtoclamlib}/daily.cld 2>&1`
+   if [ $? -ne 0 ]; then
+      echo "ClamAV UNKNOWN - $progname: installed daily version could not be determined, sigtool failed for ${pathtoclamlib}/daily.cld" 
+      exit $STATE_UNKNOWN
+   fi
+   installed_daily_version=`echo "$installed_daily_version_output" 2>&1 | grep Version 2>&1 | sed -e 's/Version: //' 2>&1`
+   if [ $? -ne 0 ]; then
+      echo "ClamAV UNKNOWN - $progname: could not parse sigtool output, for ${pathtoclamlib}/daily.cld"
+      exit $STATE_UNKNOWN
+   fi
+   ck=$( echo "$installed_daily_version" | tr -dc '[:digit:]')
+   if [[ ${#installed_daily_version} -ne ${#ck} || ${#installed_daily_version} -eq 0 ]]; then
+      echo "ClamAV UNKNOWN - $progname: could not parse sigtool output, for ${pathtoclamlib}/daily.cld" 
+      exit $STATE_UNKNOWN
+   fi
+
+else 
+   if [ -e ${pathtoclamlib}/daily.cvd ]
+   then
+      installed_daily_version_output=$(sigtool -i ${pathtoclamlib}/daily.cvd 2>&1)
+      if [ "$?" -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: installed daily version could not be determined, sigtool failed for ${pathtoclamlib}/daily.cvd"
+        exit $STATE_UNKNOWN
+      fi
+      installed_daily_version=`echo "$installed_daily_version_output" 2>&1 | grep Version 2>&1 | sed -e 's/Version: //' 2>&1`
+      if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not parse sigtool output, for ${pathtoclamlib}/daily.cvd" 
+         exit $STATE_UNKNOWN
+      fi
+      ck=$( echo "$installed_daily_version" | tr -dc '[:digit:]')
+      if [[ ${#installed_daily_version} -ne ${#ck} || ${#installed_daily_version} -eq 0 ]]; then
+         echo "ClamAV UNKNOWN - $progname: could not parse sigtool output, for ${pathtoclamlib}/daily.cvd"
+         exit $STATE_UNKNOWN
+      fi
+   else
+      echo "ClamAV UNKNOWN - $progname: installed daily version could not be determined, ${pathtoclamlib}/daily.[cvd/cld] does not exist"
+      exit $STATE_UNKNOWN
+   fi
+fi
+
+#display installed_daily_version
+if [ "$verbose" -eq 1 ]; then
+   echo "Installed daily version is $installed_daily_version according to sigtool"
+fi
+
+#get installed main version
+if [ -e ${pathtoclamlib}/main.cld ]
+then
+   installed_main_version_output=`sigtool -i ${pathtoclamlib}/main.cld 2>&1`
+   if [ $? -ne 0 ]; then
+      echo "ClamAV UNKNOWN - $progname: installed main version could not be determined, sigtool failed for ${pathtoclamlib}/main.cld"
+      exit $STATE_UNKNOWN
+   fi
+   installed_main_version=`echo "$installed_main_version_output" 2>&1 | grep Version 2>&1 | sed -e 's/Version: //' 2>&1`
+   if [ $? -ne 0 ]; then
+      echo "ClamAV UNKNOWN - $progname: could not parse sigtool output, for ${pathtoclamlib}/main.cld" 
+      exit $STATE_UNKNOWN
+   fi
+   ck=$( echo "$installed_main_version" | tr -dc '[:digit:]')
+   if [[ ${#installed_main_version} -ne ${#ck} || ${#installed_main_version} -eq 0 ]]; then
+      echo "ClamAV UNKNOWN - $progname: could not parse sigtool output for ${pathtoclamlib}/main.cld" 
+      exit $STATE_UNKNOWN
+   fi
+
+else 
+   if [ -e ${pathtoclamlib}/main.cvd ]
+   then
+      installed_main_version_output=$(sigtool -i ${pathtoclamlib}/main.cvd 2>&1)
+      if [ "$?" -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: installed main version could not be determined, sigtool failed for ${pathtoclamlib}/main.cvd"
+        exit $STATE_UNKNOWN
+      fi
+      installed_main_version=`echo "$installed_main_version_output" 2>&1 | grep Version 2>&1 | sed -e 's/Version: //' 2>&1`
+      if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: error parsing sigtool output for ${pathtoclamlib}/main.cvd" 
+         exit $STATE_UNKNOWN
+      fi
+      ck=$( echo "$installed_main_version" | tr -dc '[:digit:]')
+      if [[ ${#installed_main_version} -ne ${#ck} || ${#installed_main_version} -eq 0 ]]; then
+         echo "ClamAV UNKNOWN - $progname: error parsing sigtool output for ${pathtoclamlib}/main.cvd" 
+         exit $STATE_UNKNOWN
+      fi
+   else
+      echo "ClamAV UNKNOWN - $progname: installed main version could not be determined, ${pathtoclamlib}/main.[cvd/cld] does not exist"
+      exit $STATE_UNKNOWN
+   fi
+fi
+
+#display installed_main_version
+if [ "$verbose" -eq 1 ]; then
+   echo "Installed main version is $installed_main_version according to sigtool"
+fi
+
+#get the current daily and main versions from current.cvd.clamav.net DNS txt record
+current_versions=`host -t txt $dnshost 2>&1`
+if [ $? -ne 0 ]; then
+   echo "ClamAV UNKNOWN - $progname: current version could not be determined, host -t txt $dnshost failed"
+   exit $STATE_UNKNOWN
+fi
+current_daily_version=`echo $current_versions 2>/dev/null | sed -e 's/^.*text "//' -e 's/"//' 2> /dev/null | cut -d : -f 3 2>/dev/null`
+ck=$( echo "$current_daily_version" | tr -dc '[:digit:]')
+if [[ ${#current_daily_version} -ne ${#ck} || ${#current_daily_version} -eq 0 ]]; then
+   echo "ClamAV UNKNOWN - $progname: error parsing host output from $current_versions" 
+   exit $STATE_UNKNOWN
+fi
+current_main_version=`echo $current_versions 2>/dev/null | sed -e 's/^.*text "//' -e 's/"//' 2>/dev/null | cut -d : -f 2 2>/dev/null`
+ck=$( echo "$current_main_version" | tr -dc '[:digit:]')
+if [[ ${#current_main_version} -ne ${#ck} || ${#current_main_version} -eq 0 ]]; then
+   echo "ClamAV UNKNOWN - $progname: error parsing host output from $current_versions" 
+   exit $STATE_UNKNOWN
+fi
+
+#display current daily and main versions
+if [ "$verbose" -eq 1 ]; then
+   echo "Current daily version is $current_daily_version according to $dnshost DNS text record"
+   echo "Current main version is $current_main_version according to $dnshost DNS text record"
+
+fi
+
+#get the daily and main outdated versions and times if they exist
+if [ -e ${pathtofile}/clamav-outdated-daily ]
+then
+   outdated_daily_version=$(cat ${pathtofile}/clamav-outdated-daily 2> /dev/null | grep Version 2>/dev/null | cut -d':' -f2 2>/dev/null)
+   if [ $? -ne 0 ]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-daily"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-daily 2>/dev/null
+      echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-daily"
+      exit $STATE_UNKNOWN
+  fi
+  ck=$( echo "$outdated_daily_version" 2>/dev/null | tr -dc '[:digit:]' 2>/dev/null)
+  if [[ ${#outdated_daily_version} -ne ${#ck} || ${#outdated_daily_version} -lt 1 ]]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-daily"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-daily 2>/dev/null
+     echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-daily" 
+     exit $STATE_UNKNOWN
+  fi
+   outdated_daily_filetime=$(cat ${pathtofile}/clamav-outdated-daily 2> /dev/null | grep Time 2>/dev/null | cut -d':' -f2 2>/dev/null)
+   if [ $? -ne 0 ]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-daily"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-daily 2>/dev/null
+      echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-daily"
+      exit $STATE_UNKNOWN
+   fi
+   ck=$( echo "$outdated_daily_filetime" 2>/dev/null | tr -dc '[:digit:]' 2>/dev/null )
+   if [[ ${#outdated_daily_filetime} -ne ${#ck} || ${#outdated_daily_filetime} -lt 1 ]]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-daily"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-daily 2>/dev/null
+      echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-daily" 
+      exit $STATE_UNKNOWN
+   fi
+   outdated_daily_time=$(echo $(((`perl -e "print time" 2>/dev/null`  - $outdated_daily_filetime)/60)) 2>/dev/null)
+   ck=$( echo "$outdated_daily_time" 2>/dev/null | tr -dc '[:digit:]' 2>/dev/null )
+   if [[ ${#outdated_daily_time} -ne ${#ck} || ${#outdated_daily_time} -lt 1 ]]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-daily"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-daily 2>/dev/null
+      echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-daily" 
+      exit $STATE_UNKNOWN
+   fi
+else
+  outdated_daily_version=""
+  outdated_daily_time=0
+fi
+
+if [ -e ${pathtofile}/clamav-outdated-main ]
+then
+   outdated_main_version=$(cat ${pathtofile}/clamav-outdated-main 2> /dev/null | grep Version 2>/dev/null | cut -d':' -f2 2>/dev/null)
+   if [ $? -ne 0 ]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-main"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-main 2>/dev/null
+      echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-main"
+      exit $STATE_UNKNOWN
+  fi
+  ck=$( echo "$outdated_main_version" 2>/dev/null | tr -dc '[:digit:]' 2>/dev/null)
+  if [[ ${#outdated_main_version} -ne ${#ck} || ${#outdated_main_version} -lt 1 ]]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-main"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-main 2>/dev/null
+     echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-main" 
+     exit $STATE_UNKNOWN
+  fi
+   outdated_main_filetime=$(cat ${pathtofile}/clamav-outdated-main 2> /dev/null | grep Time 2>/dev/null | cut -d':' -f2 2>/dev/null)
+   if [ $? -ne 0 ]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-main"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-main 2>/dev/null
+      echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-main"
+      exit $STATE_UNKNOWN
+   fi
+   ck=$( echo "$outdated_main_filetime" 2>/dev/null | tr -dc '[:digit:]' 2>/dev/null )
+   if [[ ${#outdated_main_filetime} -ne ${#ck} || ${#outdated_main_filetime} -lt 1 ]]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-main"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-main 2>/dev/null
+      echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-main" 
+      exit $STATE_UNKNOWN
+   fi
+   outdated_main_time=$(echo $(((`perl -e "print time" 2>/dev/null`  - $outdated_main_filetime)/60)) 2>/dev/null)
+   ck=$( echo "$outdated_main_time" 2>/dev/null | tr -dc '[:digit:]' 2>/dev/null )
+   if [[ ${#outdated_main_time} -ne ${#ck} || ${#outdated_main_time} -lt 1 ]]; then
+      if [ $verbose -eq 1 ]; then
+         echo "Unable to parse file so removing ${pathtofile}/clamav-outdated-main"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-main 2>/dev/null
+      echo "ClamAV UNKNOWN - $progname: failed to parse ${pathtofile}/clamav-outdated-main" 
+      exit $STATE_UNKNOWN
+   fi
+else
+  outdated_main_version=""
+  outdated_main_time=0
+fi
+
+if [ "$current_daily_version" -gt "$installed_daily_version" ]
+then
+   if [ "$verbose" -eq 1 ]
+   then
+      echo "Current daily version $current_daily_version is greater than the installed daily version $installed_daily_version"
+   fi
+   if [ ! -e ${pathtofile}/clamav-outdated-daily ]
+   then
+      if [ "$verbose" -eq 1 ]
+      then
+         echo "${pathtofile}/clamav-outdated-daily does not exist"
+         echo "Writing ${pathtofile}/clamav-outdated-daily with outdated daily version $installed_daily_version"
+      fi
+      touch ${pathtofile}/clamav-outdated-daily &> /dev/null 
+      if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-daily"
+         exit $STATE_UNKNOWN
+      fi
+      echo "Version:$installed_daily_version"  > ${pathtofile}/clamav-outdated-daily 
+      if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-daily"
+         exit $STATE_UNKNOWN
+      fi
+      echo "Time:`perl -e "print time"`" >> ${pathtofile}/clamav-outdated-daily 
+      if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-daily"
+         exit $STATE_UNKNOWN
+      fi
+   else
+      if [ "$verbose" -eq 1 ]
+      then
+         echo "${pathtofile}/clamav-outdated-daily exists and reports outdated daily version: $outdated_daily_version"
+      fi
+      if [ "$outdated_daily_version" -eq "$installed_daily_version" ]
+      then
+         if [ "$verbose" -eq 1 ]
+         then
+            echo "${pathtofile}/clamav-outdated-daily reports installed daily version is out of date by $outdated_daily_time minutes" 
+         fi
+         if [ "$outdated_daily_time" -ge "$critical_threshold" ]
+         then
+            status_message="Clamav CRITICAL"
+            exit_status=$STATE_CRITICAL
+         else
+            if [ "$outdated_daily_time" -ge "$warning_threshold" ]
+            then
+               status_message="Clamav WARNING"
+               exit_status=$STATE_WARNING
+            fi
+         fi
+      else
+         if [ "$verbose" -eq 1 ] 
+         then
+            echo "Installed daily version $installed_daily_version does not equal outdated daily version $outdated_daily_version"
+            echo "Updating ${pathtofile}/clamav-outdated-daily with installed daily version $installed_daily_version"
+         fi
+         touch ${pathtofile}/clamav-outdated-daily &> /dev/null
+         if [ $? -ne 0 ]; then
+            echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-daily"
+            exit $STATE_UNKNOWN
+         fi
+            echo "Version:$installed_daily_version"  > ${pathtofile}/clamav-outdated-daily
+         if [ $? -ne 0 ]; then
+            echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-daily"
+            exit $STATE_UNKNOWN
+         fi
+            echo "Time:`perl -e "print time"`" >> ${pathtofile}/clamav-outdated-daily
+         if [ $? -ne 0 ]; then
+            echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-daily"
+            exit $STATE_UNKNOWN
+         fi
+         outdated_daily_time=0
+         outdated_daily_version=$installed_daily_version
+      fi
+   fi
+else
+   if [ "$verbose" -eq 1 ]
+   then
+      echo "Current daily version $current_daily_version is less than or equal to installed daily version $installed_daily_version"
+   fi
+   if [ -e ${pathtofile}/clamav-outdated-daily ]
+   then
+      if [ "$verbose" -eq 1 ]
+      then
+         echo "${pathtofile}/clamav-outdated-daily exists"
+         echo "Removing ${pathtofile}/clamav-outdated-daily"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-daily 2> /dev/null
+       if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not remove ${pathtofile}/clamav-outdated-daily"
+         exit $STATE_UNKNOWN
+      fi     
+      outdated_daily_time=0
+   fi
+fi
+
+if [ "$current_main_version" -gt "$installed_main_version" ]
+then
+   if [ "$verbose" -eq 1 ]
+   then
+      echo "Current main version $current_main_version is greater than the installed main version $installed_main_version"
+   fi
+   if [ ! -e ${pathtofile}/clamav-outdated-main ]
+   then
+      if [ "$verbose" -eq 1 ]
+      then
+         echo "${pathtofile}/clamav-outdated-main does not exist"
+         echo "Writing ${pathtofile}/clamav-outdated-main with outdated main version $installed_main_version"
+      fi
+      touch ${pathtofile}/clamav-outdated-main &> /dev/null 
+      if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-main"
+         exit $STATE_UNKNOWN
+      fi
+      echo "Version:$installed_main_version"  > ${pathtofile}/clamav-outdated-main 
+      if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-main"
+         exit $STATE_UNKNOWN
+      fi
+      echo "Time:`perl -e "print time"`" >> ${pathtofile}/clamav-outdated-main 
+      if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-main"
+         exit $STATE_UNKNOWN
+      fi
+   else
+      if [ "$verbose" -eq 1 ]
+      then
+         echo "${pathtofile}/clamav-outdated-main exists and reports outdated main version: $outdated_main_version"
+      fi
+      if [ "$outdated_main_version" -eq "$installed_main_version" ]
+      then
+         if [ "$verbose" -eq 1 ]
+         then
+            echo "${pathtofile}/clamav-outdated-main reports installed main version is out of date by $outdated_main_time minutes" 
+         fi
+         if [ "$outdated_main_time" -ge "$critical_threshold" ]
+         then
+            status_message="Clamav CRITICAL"
+            exit_status=$STATE_CRITICAL
+         else
+            if [ "$outdated_main_time" -ge "$warning_threshold" ]
+            then
+               status_message="Clamav WARNING"
+               exit_status=$STATE_WARNING
+            fi
+         fi
+      else
+         if [ "$verbose" -eq 1 ] 
+         then
+            echo "Installed main version $installed_main_version does not equal outdated main version $outdated_main_version"
+            echo "Updating ${pathtofile}/clamav-outdated-main with installed main version $installed_main_version"
+         fi
+         touch ${pathtofile}/clamav-outdated-main &> /dev/null
+         if [ $? -ne 0 ]; then
+            echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-main"
+            exit $STATE_UNKNOWN
+         fi
+            echo "Version:$installed_main_version"  > ${pathtofile}/clamav-outdated-main
+         if [ $? -ne 0 ]; then
+            echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-main"
+            exit $STATE_UNKNOWN
+         fi
+            echo "Time:`perl -e "print time"`" >> ${pathtofile}/clamav-outdated-main
+         if [ $? -ne 0 ]; then
+            echo "ClamAV UNKNOWN - $progname: could not write to ${pathtofile}/clamav-outdated-main"
+            exit $STATE_UNKNOWN
+         fi
+         outdated_main_time=0
+         outdated_main_version=$installed_main_version
+      fi
+   fi
+else
+   if [ "$verbose" -eq 1 ]
+   then
+      echo "Current main version $current_main_version is less than or equal to installed main version $installed_main_version"
+   fi
+   if [ -e ${pathtofile}/clamav-outdated-main ]
+   then
+      if [ "$verbose" -eq 1 ]
+      then
+         echo "${pathtofile}/clamav-outdated-main exists"
+         echo "Removing ${pathtofile}/clamav-outdated-main"
+      fi
+      rm -f ${pathtofile}/clamav-outdated-main 2> /dev/null
+       if [ $? -ne 0 ]; then
+         echo "ClamAV UNKNOWN - $progname: could not remove ${pathtofile}/clamav-outdated-main"
+         exit $STATE_UNKNOWN
+      fi     
+      outdated_main_time=0
+   fi
+fi
+
+if [ ! -e ${pathtofile}/clamav-outdated-daily ]
+then
+   if [ ! -e ${pathtofile}/clamav-outdated-main ]
+   then
+      echo "$status_message - daily version: $installed_daily_version up to date, main version: $installed_main_version up to date"
+   else
+     echo "$status_message - main version: $installed_main_version out of date by $outdated_main_time minutes, daily version: $installed_daily_version up to date"
+   fi
+else
+   if [ ! -e ${pathtofile}/clamav-outdated-main ]
+   then
+      echo "$status_message - daily version: $installed_daily_version out of date by $outdated_daily_time minutes, main version: $installed_main_version up to date"
+   else
+      if [ "$outdated_daily_time" -le "$outdated_main_time" ]
+      then
+         echo "$status_message - main version: $installed_main_version out of date by $outdated_main_time minutes, daily version: $installed_daily_version out of date by $outdated_daily_time minutes"
+      else
+         echo "$status_message - daily version: $installed_daily_version out of date by $outdated_daily_time minutes, main version: $installed_main_version out of date by $outdated_main_time minutes"
+      fi
+   fi
+fi
+exit $exit_status
+

@@ -1,0 +1,12 @@
+#!/bin/bash
+# richton 27 Sep 2010 ... I know it's lame for the port to be hard-coded, but I run the servers so I know it's true, too bad
+
+# we're almost all shell built-ins, no biggie to be explicit
+PATH=
+
+[ -z $1 ] && echo "LDAPSubmitter UNKNOWN - Recipient address is required parameter" && exit 3
+
+OUTPUT=`printf "request=smtpd_access_policy\nprotocol_state=RCPT\nrecipient=$1\nsender=nobody@jla.rutgers.edu\n\n" | /usr/bin/nc -w 3 localhost 9998` 
+echo $OUTPUT | /bin/egrep -q '^action=DUNNO$'
+[ $? -eq 0 ] && echo "LDAPSubmitter OK - Response \"$OUTPUT\"" && exit 0
+echo "LDAPSubmitter CRITICAL - Response \"$OUTPUT\"" && exit 2

@@ -1,0 +1,373 @@
+#! /usr/bin/perl
+# Written by David Diffenbaugh
+# Last Modified: 19-Oct-2010 13:23
+# Revision: 4
+
+use warnings;
+use strict;
+use Getopt::Long;
+use lib "/usr/lib64/nagios/plugins/";
+use utils qw(%ERRORS $TIMEOUT &print_revision);
+use vars qw($PROGNAME $revision);
+
+sub print_help ();
+sub print_usage ();
+sub remove_space($);
+$SIG{'ALRM'} = 'alrm_handler';
+
+# basename of this program
+($PROGNAME = $0) =~ s|.*\/||;
+
+#variable declarations
+my ($opt_V, $opt_v, $opt_h, $opt_c, $timeout, $delimiter, $comma);
+my ($config_filename, $name_column, $key_column, $status_column, $default);
+my ($output_filename, $command, $no_output, $pid, $exit_code, $return_status);
+
+my (%searchkeys, %printnames, @warning, @critical, @ok);
+
+#set default values
+$name_column = 1;
+$status_column = 2;
+$key_column = 3;
+$default = "CRITICAL";
+$return_status = "OK";
+$exit_code = $ERRORS{'OK'};
+$pid=$$;
+
+#parse command line arguments
+$opt_V = 0;
+$opt_v = 0;
+$opt_h = 0;
+$opt_c = 0;
+$timeout = $TIMEOUT;
+$delimiter = "|";
+$comma = "";
+
+Getopt::Long::Configure('bundling');
+GetOptions(
+        "V"   => \$opt_V, "version"     => \$opt_V,
+        "v"   => \$opt_v, "verbose"     => \$opt_v,
+        "h"   => \$opt_h, "help"        => \$opt_h,
+        "c"   => \$opt_c, "comma"       => \$opt_c,
+        "t=i" => \$timeout, "timeout=i" => \$timeout,
+        "d=s" => \$delimiter, "delimiter=s" => \$delimiter);
+
+if ($opt_c)
+{
+   $comma = "-c";
+}
+
+if ($opt_V)
+{
+   print_revision($PROGNAME, '$Revision: 4 $');
+   exit $ERRORS{'OK'};
+}
+
+if ($opt_h)
+{
+   print_help();
+   exit $ERRORS{'OK'};
+}
+
+if (@ARGV != 1)
+{
+   print "$PROGNAME: Please specifiy a configuration filename\n";
+   print_usage();
+   exit $ERRORS{'OK'};
+}
+else
+{
+   $config_filename = $ARGV[0];
+}
+
+#set alarm incase this plugin hangs so nagios doesn't have to wait
+alarm($timeout);
+
+#open config file and process configuration
+open CONFIG, "$config_filename" or (print "IPMI UNKNOWN - could not open $config_filename: $!\n" and exit $ERRORS{'UNKNOWN'});
+while ( my $line = <CONFIG> )
+{
+   chomp $line;
+   if ($line =~ m'^#\s*config:([^:]+):([^:]+):([^:]+)*\s*$')
+   {  
+      my $type = $1;
+      my $searchkey = $2;
+      my $result = $3;
+      if ( $type =~ /^key$/ )
+      {
+         if ( $searchkey =~ /\*/ )
+         {
+            $default = $result;
+         }
+         elsif ( $searchkey =~/^\s+$/ )
+         {
+            $searchkeys{"blank"} = $result;
+         }
+         else
+         {
+            $searchkeys{$searchkey} = $result; 
+         }
+      }
+      else
+      {
+         print "IPMI UNKNOWN - bad format in $config_filename\n";
+         exit $ERRORS{'UNKNOWN'};
+      }
+   }
+   elsif ($line =~ m'^#\s*config:([^:]+):([^:]+)*\s*$')
+   {
+      my $type = $1;
+      my $value = $2;
+      if ( $type =~ /^column$/ )
+      {
+         $key_column = $value;
+      }
+      elsif ( $type =~ /^status$/ )
+      {
+         $status_column = $value;
+      }
+      elsif ( $type =~ /^namecol$/ )
+      {
+         $name_column = $value;
+      }
+      elsif ( $type =~ /^print$/ )
+      {
+         $printnames{$value} = "true";
+      }
+      else
+      {
+         print "IPMI UNKNOWN - bad format in $config_filename\n"; 
+         exit $ERRORS{'UNKNOWN'};
+      }
+   }
+   elsif ($line =~ m'^#\s*config.*$' )
+   {
+      print "IPMI UNKNOWN - bad format in $config_filename\n";
+      exit $ERRORS{'UNKNOWN'};
+   }
+}
+
+#run ipmitool command and process output
+$output_filename = "/tmp/check_ipmi.$pid";
+$command = "/usr/bin/sudo /usr/bin/ipmitool $comma exec $config_filename &> $output_filename";
+system($command);
+open IPMITOOL, "$output_filename" or (print "IPMI UNKNOWN - could not open check_ipmi output file: $!\n" and exit $ERRORS{'UNKNOWN'});
+
+$no_output = 1;
+while (my $line = <IPMITOOL>)
+{
+   $no_output = 0;
+   my @field;
+   my $count = 0;
+   chomp $line;
+   if ( $delimiter =~ /:/ )
+   {
+      if ( $line =~ /^[^:]+:.*$/)
+      {
+         $count = 0;
+         while ( $line =~ /^([^:]+):(.*)$/ )
+         {
+            $field[$count] = remove_space $1 ;
+            $line = $2;
+            $count = $count + 1;
+         }
+         $field[$count] = remove_space $line;
+      }
+      else
+      {
+         print "IPMI UNKNOWN - bad format in ipmitool output: $line\n";
+         unlink($output_filename);
+         exit $ERRORS{'UNKNOWN'};
+      }
+   }
+   elsif ( $delimiter =~ /\|/ )
+   {
+      if( $line =~ /^[^\|]+\|.*$/)
+      {
+         $count = 0;
+         while ( $line =~ /^([^\|]+)\|(.*)$/ )
+         {
+            $field[$count] = remove_space $1;
+            $line = $2;
+            $count = $count + 1;
+         }
+         $field[$count] = remove_space $line;
+      }
+      else
+      {
+         print "IPMI UNKNOWN - bad format in ipmitool output: $line\n";
+         unlink($output_filename);
+         exit $ERRORS{'UNKNOWN'};
+      }
+
+   }
+   elsif ( $delimiter =~ /,/ )
+   {
+      if ( $line =~ /^[^,]+,.*$/ )
+      {
+         $count = 0;
+         while ( $line =~ /^([^,]+),(.*)$/ )
+         {
+            $field[$count] = remove_space $1;
+            $line = $2;
+            $count = $count + 1;
+         }
+         $field[$count] = remove_space $line;
+      }
+      else
+      {
+         print "IPMI UNKNOWN - bad format in ipmitool output: $line\n";
+         unlink($output_filename);
+         exit $ERRORS{'UNKNOWN'};
+      }
+   }
+   else
+   {
+      print "IPMI UNKNOWN - invalid delimiter: '$delimiter'\n";
+      unlink($output_filename);
+      exit $ERRORS{'UNKNOWN'};
+   }
+   my $name;
+   my $status;
+   my $searchkey;
+   my $result;
+
+   $name  = $field[$name_column-1];
+
+   if ( $status_column != 0 )
+   {
+      $status = $field[$status_column-1];
+   }
+   
+   $searchkey = $field[$key_column-1];
+   if ( $searchkey =~ /^$/ )
+   {
+      $searchkey = "blank";
+   }
+   
+   if ( exists $searchkeys{$searchkey} )
+   {
+      $result = $searchkeys{$searchkey}; 
+   }
+   else
+   {
+      $result = $default;
+   }
+   
+   if ( $result =~ /OK/ ) 
+   {
+      if (exists $printnames{$name} )
+      {
+         if ( $status_column != 0 )
+         {
+            push @ok, "$name=$status";
+         }
+         else
+         {
+            push @ok, "$name=$searchkey";
+         }
+      }
+   }
+
+   if ( $result =~ /WARNING/  )
+   {
+      if ( $return_status =~ /OK/ )
+      {
+         $return_status = "WARNING";
+      }
+      if ( $status_column != 0 )
+      {
+         push @warning, "$name reports $searchkey ($status)";
+      }
+      else
+      {
+         push @warning, "$name reports $searchkey";
+      }
+   }
+
+   elsif ( $result =~ /CRITICAL/ )
+   {
+      $return_status = "CRITICAL";
+      if ( $status_column != 0 )
+      {
+         push @critical, "$name reports $searchkey ($status)";
+      }
+      else
+      {
+         push @critical, "$name reports $searchkey";
+      }
+   }
+}
+
+#delete output file since we are done processing it
+unlink($output_filename);
+
+if ( $no_output == 1 )
+{
+   print "IPMI UNKNOWN - no output from /usr/bin/ipmitool $comma exec $config_filename \n";
+   exit $ERRORS{'UNKNOWN'};
+}
+elsif ( $return_status =~ /WARNING/ )
+{
+   print "IPMI SENSORS WARNING - ";
+   $exit_code = $ERRORS{'WARNING'};
+}
+elsif ( $return_status =~ /CRITICAL/ )
+{
+   print "IPMI SENSORS CRITICAL - ";
+   $exit_code = $ERRORS{'CRITICAL'};
+}
+else
+{
+   # trailing space will be put in by the @crit/@warn join
+   print "IPMI OK -";
+   $exit_code = $ERRORS{'OK'};
+}
+
+print join(", ", @critical, @warning). " ";
+if (@ok) { print "(" . join(", ", @ok). ")"; }
+print "\n";
+
+# exit out
+exit ($exit_code); 
+
+sub alrm_handler {
+        print ("IPMI UNKNOWN - process killed because timeout occurred\n");
+        unlink($output_filename);
+        exit $ERRORS{'UNKNOWN'};
+};
+
+sub print_help () {
+        print_revision($PROGNAME, '$Revision: 3 $');
+        print_usage();
+        print "Options:\n";
+        print " -V, --version\n";
+        print "    Print version information\n";
+        print " -h, --help\n";
+        print "    Print detailed help screen\n";
+        print " -d, --delimiter\n";
+        print "    Delimiter expected in ipmitool output, (default: '|' )\n";
+        print " -t, --timeout\n";
+        print "    Seconds before ipmitool times out (default: $TIMEOUT)\n";
+        print " -v, --verbose\n";
+        print "    Show details for command-line debugging\n";
+        print " <filename>\n";
+        print "    Required: must specify location of $PROGNAME configuration filename\n\n"; 
+        print " Example:\n";
+        print "    $PROGNAME -d':' -t 15 chassis_status.cfg\n";
+
+}
+
+sub print_usage () {
+        print "Usage:\n";
+        print "  $PROGNAME [-d <delimiter>] [-t <secs>] [-v] <filename>\n";
+        print "  $PROGNAME [-h, --help]\n";
+        print "  $PROGNAME [-V, --version]\n";
+}
+
+sub remove_space ($) {
+        my ($value) = @_;
+        $value =~ s/^ +//;
+        $value =~ s/ +$//;
+        return $value;
+}

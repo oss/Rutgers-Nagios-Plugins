@@ -1,0 +1,118 @@
+#!/usr/bin/perl
+
+## check_mailman_qfiles
+#
+#  Simple perl script to check the various mailman qfiles directories for old,
+#  unprocessed items and report on freshness.
+#
+#  Eric Waters <ewaters@xmission.com> 27-Apr-2007
+
+use strict;
+use vars qw($pgm);
+
+($pgm = $0) =~ s|.*\/||;        # basename this program
+
+use warnings;
+use File::Find::Rule;
+use Getopt::Std;
+use vars qw($opt_h $opt_q $opt_w $opt_c);
+use lib "/usr/lib64/nagios/plugins";
+use utils qw(%ERRORS);
+
+my ($qfiles_base, $warning, $critical);
+
+# Defaults
+$qfiles_base = '/var/spool/mailman';
+
+# Print usage
+sub print_usage(){
+  print STDERR <<"EndOfUsage";
+  usage: $pgm [-h] [-q <qfiles path>] -w <minutes> -c <minutes> 
+  where: -h help (print out this usage)
+         -q (default qfiles path: $qfiles_base)
+         -w <minutes>
+         -c <minutes>
+
+  <minutes>  qfiles must be no more than this many minutes old
+EndOfUsage
+  exit $ERRORS{'UNKNOWN'};
+}
+
+# Process args
+getopts('hq:w:c:');
+print_usage() if $opt_h;
+$qfiles_base = $opt_q if $opt_q;
+print_usage() if ! $opt_w;
+print_usage() if ! $opt_c;
+
+if (! -d $qfiles_base) {
+    print "The qfiles path $qfiles_base does NOT exist!\n";
+    print_usage();
+}
+
+if ($opt_w >= $opt_c) {
+    print "Warning (-w) cannot be greater than Critical (-c)!\n";
+    print_usage();
+}
+
+# convert to seconds
+$warning  = 60 * $opt_w;
+$critical = 60 * $opt_c;
+
+my %problems;
+my $problem_status;
+
+foreach my $qdir (qw(archive bounces commands in news out retry)) {
+	# Get all the 'pickle' files in the queue directory
+	my @files = File::Find::Rule->file->name('*.pck')->in("$qfiles_base/$qdir");
+	next unless @files;
+
+	# Get the modification times of the files, sorted desc
+	my @mtimes = sort { $a <=> $b } map { (stat($_))[9] } @files;
+
+	# Age of the oldest file in queue
+	my $diff = time - $mtimes[0];
+
+	#if ($diff > $opts{critical}) {
+	if ($diff > $critical) {
+		$problems{$qdir} = [ 'CRITICAL' ];
+		$problem_status = 'CRITICAL';
+	}
+	#elsif ($diff > $opts{warning}) {
+	elsif ($diff > $warning) {
+		$problems{$qdir} = [ 'WARNING' ];
+		$problem_status = 'WARNING' if ! $problem_status;;
+	}
+
+	if ($problems{$qdir}) {
+		$problems{$qdir}[1] = sprintf "%d tasks, oldest %s", int(@files), describe_diff($diff);
+	}
+}
+
+if (! $problem_status) {
+	print "OK: all normal\n";
+	exit $ERRORS{'OK'};
+}
+
+print "$problem_status: ".join('; ', map { "$_ has $problems{$_}[1]" } sort keys %problems)."\n";;
+
+exit ($problem_status eq 'CRITICAL' ? $ERRORS{'CRITICAL'} : $ERRORS{'WARNING'});
+
+sub describe_diff {
+	my $diff = shift;
+
+	my $units = 'sec';
+	if ($diff > 60) {
+		$diff /= 60;
+		$units = 'min';
+	}
+	if ($units eq 'min' && $diff > 60) {
+		$diff /= 60;
+		$units = 'hr';
+	}
+	if ($units eq 'day' && $diff > 24) {
+		$diff /= 24;
+		$units = 'day';
+	}
+	return sprintf "%.1f %s%s", $diff, $units, $diff == 1 ? '' : 's';
+}

@@ -1,0 +1,91 @@
+#!/bin/bash
+
+WARNING=0
+CRITICAL=0
+MSG=''
+DEBUG=0
+PATH=/usr/kerberos/bin:/usr/local/bin:/bin:/usr/bin:/usr/X11R6/bin:/sbin:/usr/sbin
+
+function syntax_error_exit {
+	echo "DHCP UNKNOWN: Syntax should be INTERFACE,SERVERIP,[WARNING|CRITICAL]: $*"
+	exit 3
+}
+
+function debug_echo {
+
+	if [ $DEBUG = 1 ]; then
+		echo $*
+	fi
+
+}
+
+for test in $*; do
+	params=(`echo $test | sed s/,/\ /g`)
+	ERROR=0
+	XMSG=''
+
+	INTERFACE=${params[0]}
+	ip link show $INTERFACE &> /dev/null
+	if [ $? != 0 ]; then
+		syntax_error_exit "Interface $INTERFACE error"
+	fi
+
+	SERVERIP=${params[1]}
+	if [ -z $SERVERIP ]; then
+		syntax_error_exit "Server IP not specified"
+	fi
+
+	NAGIOS=${params[2]}
+	if [[ $NAGIOS != "CRITICAL" && $NAGIOS != "WARNING" ]]; then
+		syntax_error_exit "Nagios error type not specified"
+	fi	
+	
+	debug_echo "Checking $INTERFACE $SERVERIP $NAGIOS"
+	
+	SERVERIPGIVEN=`/usr/bin/sudo /sbin/dhclient -lf /dev/null -pf /tmp/check_dhcp.pid -sf /usr/bin/env -1 -q $INTERFACE 2>&1 | grep "new_dhcp_server_identifier"`
+	RET=$?
+	
+	debug_echo "$SERVERIPGIVEN $RET"
+
+	if [ $RET = 0 ]; then
+		SERVERIPGIVEN=`echo $SERVERIPGIVEN | sed s/new_dhcp_server_identifier=//g`
+		debug_echo "Comparing $SERVERIP $SERVERIPGIVEN"
+		if [ $SERVERIP != $SERVERIPGIVEN ]; then
+			XMSG=":$SERVERIP!=$SERVERIPGIVEN"
+			ERROR=1
+		fi
+	else
+		ERROR=1
+	fi
+
+	if [ $ERROR = 1 ]; then
+		if [ $NAGIOS == "CRITICAL" ]; then
+			MSG="$MSG CRIT:$INTERFACE$XMSG"
+			CRITICAL=1
+		fi
+		if [ $NAGIOS == "WARNING" ]; then
+			MSG="$MSG WARN:$INTERFACE$XMSG"
+			WARNING=1
+		fi
+
+	fi
+
+	if [ -s /tmp/check_dhcp.pid ]; then
+		kill -9 `cat /tmp/check_dhcp.pid` &> /dev/null
+	fi
+
+done
+
+debug_echo "Loop done"
+
+if [ $CRITICAL = 1 ]; then
+	echo "DHCP CRITICAL - $MSG"
+	exit 2
+else if [ $WARNING = 1 ]; then
+	echo "DHCP WARNING - $MSG"
+	exit 1
+else
+	echo "DHCP OK"
+	exit 0
+fi
+fi

@@ -1,0 +1,3 @@
+Attention: The executable binary "check_by_http" has to be compiled
+within the nagios-plugins package, and then needs to be copied into this
+nagios_plugins_ru package by hand.

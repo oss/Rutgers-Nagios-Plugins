@@ -1,0 +1,137 @@
+#!/usr/bin/perl -w --      -*- Perl -*-
+
+# boilerplate template for common perl programs
+
+use strict;
+use vars qw($pgm $output $newoutput);
+
+($pgm = $0) =~ s|.*\/||;        # basename this program
+
+use Getopt::Std;
+use vars qw($opt_d $opt_h $opt_f);
+use lib "/usr/lib64/nagios/plugins";
+use utils qw(%ERRORS);
+
+$opt_f = '';
+
+#############
+# FUNCTIONS #
+#############
+
+## Return the max integer
+sub mymax($$){
+  my $max = $_[0];
+  if($_[1] > $_[0]){
+    $max = $_[1];
+  }
+  return $max;
+}
+
+## Print debugging info if turned on
+sub myprint($){
+  print "$_[0]\n" if $opt_d;
+}
+
+sub print_usage(){
+  print STDERR <<"EndOfUsage";
+  usage: $pgm [-h] [-d] -f <file>
+  where: -d debug
+         -h help (print out this usage) 
+         -f file this glue program reads
+EndOfUsage
+  exit $ERRORS{'UNKNOWN'};
+}
+
+unless (getopts('dhf:') && $#ARGV < 0) {
+  print_usage();
+}
+
+if($opt_h){
+  print_usage();
+}
+
+$opt_f = shift unless ($opt_f);
+
+if (! $opt_f) {
+        print "FILE_CONTENTS UNKNOWN: No file specified\n";
+        exit $ERRORS{'UNKNOWN'};
+}
+
+# Check that file exists and can we read it (can be directory or link)
+unless (-e $opt_f) {
+        print "FILE_CONTENTS CRITICAL: File not found or unreadable - $opt_f\n";
+        exit $ERRORS{'CRITICAL'};
+}
+
+my $w_output = "";
+my $e_output = "";
+my $d_output = "";
+my $w_seenflag = 0;
+my $e_seenflag = 0;
+my $d_seenflag = 0;
+my $exitcode = 0;
+my $curr_exitcode = 0;
+
+# Lets read the file and build some output and determine the exit code
+open(FH, "< $opt_f") or die("Can't open $opt_f: $!");
+while(<FH>){
+  s/^#.*$//;      #replace comment line with blank line
+  next if m/^$/;  #skip blank lines
+  myprint("Original Line: $_");
+  if(/^WARNING:\s+(.*)/){
+    $curr_exitcode = 1;
+    $w_seenflag = 1;
+    $w_output .= "[ $1 ] ";
+  }
+  elsif(/^CRITICAL:\s+(.*)/){
+    $curr_exitcode = 2;
+    $e_seenflag = 1;
+    $e_output .= "[ $1 ] ";
+  }
+  elsif(/^DIFF:\s+(.*)/){
+    $curr_exitcode = 0;
+    $d_seenflag = 1;
+    $d_output .= "[ $1 ] ";
+  }
+  else{
+    $curr_exitcode = 0;
+  }
+  $exitcode = mymax($exitcode,$curr_exitcode);
+}
+close(FH) or die("Can't close $opt_f: $!");
+
+my $file = "$opt_f";
+
+if($d_seenflag && $e_seenflag && $w_seenflag){
+  print("FILE_CONTENTS $file $d_output CRITICAL - $e_output WARNING - $w_output\n");
+}
+elsif($d_seenflag && $e_seenflag){
+  print("FILE_CONTENTS $file $d_output CRITICAL - $e_output\n");
+}
+elsif($d_seenflag && $w_seenflag){
+  print("FILE_CONTENTS $file $d_output WARNING - $w_output\n");
+}
+elsif($d_seenflag){
+  print("FILE_CONTENTS $file $d_output OK\n");
+}
+elsif($e_seenflag && $w_seenflag){
+  print("FILE_CONTENTS $file CRITICAL - $e_output WARNING - $w_output\n");
+}
+elsif($w_seenflag){
+  print("FILE_CONTENTS $file WARNING - $w_output\n");
+}
+elsif($e_seenflag){
+  print("FILE_CONTENTS $file CRITICAL - $e_output\n");
+}
+else{
+  print("FILE_CONTENTS $file OK\n");
+}
+
+for($exitcode){
+  /0/ && do { exit $ERRORS{"OK"}; };
+  /1/ && do { exit $ERRORS{"WARNING"}; };
+  /2/ && do { exit $ERRORS{"CRITICAL"}; };
+  exit $ERRORS{"UNKNOWN"};
+}
+
+exit -1;

@@ -1,0 +1,33 @@
+#!/bin/bash
+
+PGM=`basename $0`
+MYPID=$$
+TIMEOUT=4
+
+printUsage() {
+    echo 'Usage: $PGM [-T TIMEOUT (value in seconds)]'
+    exit 1
+}
+
+while getopts "T:" opt; do
+    case $opt in
+        T  ) TIMEOUT=$OPTARG ;;
+        \? ) printUsage
+    esac
+done
+shift $(($OPTIND-1))
+
+# Waits TIMEOUT seconds, then kills command invoked below
+sleep $TIMEOUT && [ `pgrep -P $MYPID | wc -l` -gt "0" ] && echo "CRITICAL: IMAP Auth appears wedged" && pkill -n -P $MYPID && touch /tmp/brylon &
+
+perl -MIO::Socket::UNIX -we 'my $s=IO::Socket::UNIX->new ("/var/run/courier/authdaemon/socket") ; $s->close'
+
+# We need this b/c if the touch happens above it is almost in parallel with
+# the execution of code below.
+sleep 2
+
+# Is the time up, and the command killed?
+[ -e /tmp/brylon ] && rm /tmp/brylon && exit 2
+
+# Otherwise the perl command returned
+echo "OK: IMAP Auth" && exit 0

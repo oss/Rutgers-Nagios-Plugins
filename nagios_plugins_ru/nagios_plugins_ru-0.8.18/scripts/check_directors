@@ -1,0 +1,114 @@
+#!/bin/sh
+
+PROGNAME=`basename $0`
+VERSION="Version 1.0,"
+AUTHOR="2011, Tom Pawlowski <tompru@rutgers.edu>"
+
+ST_OK=0
+ST_WR=1
+ST_CR=2
+ST_UK=3
+
+interval=1
+
+print_version() {
+    echo "$VERSION $AUTHOR"
+}
+
+print_help() {
+    print_version $PROGNAME $VERSION
+    /bin/cat << EOM
+
+$PROGNAME is a Nagios plugin to monitor the status of a Dovecot Director's
+neighbors. In a dual node setup, it should have two established connections
+on port 9090: one to its neighbor, and one back.
+
+In a three or more ring setup, an individual director should have four
+established connections: two from/to one neighbor, and two from/to another.
+
+This plugin accepts the following options:
+
+$PROGNAME <-n/--number> <-w/--warning> <-c/--critical>
+
+Options:
+--number|-n)
+  Defines the number of neighbors the host should have an established
+  connection to.
+--warning|-w)
+  Defines the number of established neighbors that should produce a
+  warning response (this implies a degraded state)
+--critical|-c)
+  Defines the number of established neighbors that should produce a
+  critical response (this implies a broken state)
+
+Examples:
+
+Two directors:   $PROGNAME -n 1 -w 0 -c 0
+Three or more:   $PROGNAME -n 2 -w 1 -c 0
+
+EOM
+}
+
+while test -n "$1"; do
+    case "$1" in
+        --help|-h)
+            print_help
+            exit $ST_UK
+            ;;
+        --version|-v)
+            print_version $PROGNAME $VERSION
+            exit $ST_UK
+            ;;
+        --number|-n)
+            number=$2
+            shift
+            ;;
+        --warning|-w)
+            warn=$2
+            shift
+            ;;
+        --critical|-c)
+            crit=$2
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            print_help
+            exit $ST_UK
+            ;;
+    esac
+    shift
+done
+
+get_dircount() {
+  num_conns=`/usr/sbin/lsof -ni TCP:9090 | /bin/grep -c ESTABLISHED`
+  dir_count=`expr ${num_conns} / 2`
+}
+
+do_output() {
+  output="director_count: ${dir_count}"
+}
+
+get_dircount
+do_output
+
+if [ -n "$warn" -a -n "$crit" ]
+then
+    if [ "$dir_count" -le "$crit" ]
+    then
+      echo "CRITICAL - ${output}"
+      exit $ST_CR
+    fi
+
+    if [ "$dir_count" -le "$warn" ]
+    then
+      echo "WARNING - ${output}"
+      exit $ST_WR
+    fi
+
+    echo "OK - ${output}"
+    exit $ST_OK
+else
+  print_help
+  exit $ST_UK
+fi

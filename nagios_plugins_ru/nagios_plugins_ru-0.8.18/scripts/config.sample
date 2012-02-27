@@ -1,0 +1,15 @@
+[main]
+#Times are in hours
+default_warn_time=24
+default_crit_time=168
+server_name=clamav.camden.rutgers.edu
+unzipped_directory=/path/to/unzipped/files/
+status_directory=/path/to/status/files/
+
+#everything in this file must be formatted as key=value
+#for filenames, though, we only care about the value, the keys don't matter
+#they just have to be present for it to parse
+[Filenames]
+file1=junk.ndb.gz
+file2=lott.ndb.gz
+file3=spearl.ndb.gz
