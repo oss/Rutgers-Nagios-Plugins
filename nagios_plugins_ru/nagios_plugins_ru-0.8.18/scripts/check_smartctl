@@ -22,6 +22,8 @@
 #   with this program; if not, write to the Free Software Foundation, Inc.,
 #   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+# See the bottom of the file for /etc/sudoers snippet
+
 
 """Package versioning
 """
@@ -368,3 +370,20 @@ if __name__ == "__main__":
 	exitWithMessage(overallvalue, message_string[:-1])
 
 # fi
+
+"""
+# /etc/sudoers snippet
+# 
+# this fragment is required for this script to run
+# smartctl under root without asking for a password
+
+Cmnd_Alias SMARTCTL_GET_ATTRIBUTES = \
+    /usr/sbin/smartctl -d ata /dev/sd? -a, \
+    /usr/sbin/smartctl -d scsi /dev/sd? -a
+
+# You may want to replace the first ALL with the name of the
+# actual account under which Nagios/Icinga is running
+ALL   ALL = (ALL) NOPASSWD: SMARTCTL_GET_ATTRIBUTES
+
+"""
+
