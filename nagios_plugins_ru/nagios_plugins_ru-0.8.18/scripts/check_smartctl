@@ -31,6 +31,7 @@ import os.path
 import subprocess
 import sys
 import time
+import re
 
 from optparse import OptionParser
 from operator import itemgetter, attrgetter
@@ -45,6 +46,20 @@ _smartctlPath = "/usr/sbin/smartctl"
 
 # application wide verbosity (can be adjusted with -v [0-3])
 _verbosity = 0
+
+_checkAttributes = {
+        'Reallocated_Sector_Ct':   (1,),
+        'Spin_Retry_Count':        (10, 1),
+        'Reallocated_Event_Count': (10, 1),
+        'Offline_Uncorrectable':   (1,),
+        'Current_Pending_Sector':  (1,),
+
+        # temperature entry
+        'Temperature_Celsius':     -1,
+}
+
+_attributesRegex = re.compile(
+        r'^\s*[0-9]+\s+(' + '|'.join(_checkAttributes.keys()) + ')')
 
 is_array = lambda var: isinstance(var, (list, tuple))
 
@@ -67,6 +82,8 @@ def parseCmdLine(args):
         parser.add_option("-c", "--critical-threshold", metavar="TEMP", action="store",
                         type="int", dest="criticalThreshold", default="60",
                         help="set temperature critical threshold to given temperature (defaults to 60)")
+        parser.add_option("-a", "--check-attributes", default=False,
+                        action='store_true', dest="check_attributes", help="check some attributes separately")
 
 	(options,devices) = parser.parse_args(sys.argv[1:])
 
@@ -164,51 +181,104 @@ def callSmartMonTools(path, devicetype, device):
 # end
 
 
-def parseOutput(Message):
+def formatAttributeWarnings(attrCheckWarnings):
+        return ', '.join("(%s) %s" % (('CRIT' if x[0] >= 2 else 'WARN'), x[1])
+                    for x in attrCheckWarnings)
+
+
+def parseOutput(Message, options):
         """Parse smartctl output
 
-        Returns (health status, temperature).
+        Returns (health status, temperature, attribute check warnings).
         """
 
         # parse health status and temperature
 	healthStatus=""
         temperature = None
         lines = Message.split("\n")
+
+        attrCheckWarnings = None
+
+        if options.check_attributes:
+            attrCheckWarnings = []
+
         for line in lines:
 		if line.find("INQUIRY failed") > -1:
 			exitWithMessage(1, "UNKNOWN: " + line)
+
 		if line.startswith("SMART Health Status:") or line.startswith("SMART overall-health self-assessment"):
-			healthStatus = line.split()[-1]
+                        healthStatus = line.split()[-1]
+                        continue
+
 		if line.startswith("Current Drive Temperature:"):
-			temperature = int(line.split()[-2])
-			break
+			try:
+			        temperature = int(line.split()[-2])
+                        except:
+                                pass
+                        continue
+
+                m = _attributesRegex.match(line)
+                if m:
+                        attrLevels = _checkAttributes[m.group(1)]
+                        value = int(line.split()[-1])
+                        if attrLevels == -1:
+                                temperature = value
+                        elif not attrCheckWarnings == None:
+                                if attrLevels[0] <= value:
+                                        attrCheckWarnings.append(
+                                                (2, "%s=%d[>=%d]" % (m.group(1), value, attrLevels[0])))
+                                elif len(attrLevels) > 1 and attrLevels[1] <= value:
+                                        attrCheckWarnings.append(
+                                                (1, "%s=%d[>=%d]" % (m.group(1), value, attrLevels[0])))
+
 
 	vprint(3, "Health status: %s" % healthStatus)
-        vprint(3, "Temperature: %s" %temperature)
+        vprint(3, "Temperature: %s" % temperature)
+        if attrCheckWarnings:
+                vprint(3, "Attribute warnings: %s" % formatAttributeWarnings(attrCheckWarnings))
 
-        return (healthStatus, temperature)
+        return (healthStatus, temperature, attrCheckWarnings)
 # end
 
 
 def createReturnInfo(device, devicetype, healthStatus, temperature, warningThreshold,
-                criticalThreshold):
+                criticalThreshold, attrCheckWarnings):
         """Create return information according to given thresholds."""
         # this is absolutely critical!
 	if healthStatus != "PASSED" and healthStatus != "OK":
 		if healthStatus == "":
-			return (2, "CRITICAL: device %s of type %s did not pass a health status." % (device, devicetype))
-                return (2, "CRITICAL: device %s of type %s passed health status: (%s)" % (device, devicetype, healthStatus))
+			return (2, "CRITICAL: device %s of type %s did not pass a health status."
+                                % (device, devicetype))
+                return (2, "CRITICAL: device %s of type %s passed health status: (%s)"
+                        % (device, devicetype, healthStatus))
 	elif temperature == None and devicetype != "ata":
-		return (2, "CRITICAL: device %s of type %s does not pass temperature information" % (device, devicetype))
+		return (2, "CRITICAL: device %s of type %s does not pass temperature information"
+                        % (device, devicetype))
 
         elif temperature > criticalThreshold:
-                return (2, "CRITICAL: device %s of type %s temperature (%d) exceeds critical temperature threshold (%s)" % (device, devicetype, temperature, criticalThreshold))
+                return (2, "CRITICAL: device %s of type %s temperature (%d) exceeds critical temperature threshold (%s)"
+                        % (device, devicetype, temperature, criticalThreshold))
         elif temperature > warningThreshold:
-                return (1, "WARNING: device %s of type %s temperature (%d) exceeds warning temperature threshold (%s)" % (device, devicetype, temperature, warningThreshold))
+                return (1, "WARNING: device %s of type %s temperature (%d) exceeds warning temperature threshold (%s)"
+                        % (device, devicetype, temperature, warningThreshold))
+
+        elif attrCheckWarnings:
+                attrWarningLevel = 0
+                for acw in attrCheckWarnings:
+                        if attrWarningLevel < acw[0]:
+                                attrWarningLevel = acw[0]
+
+                if attrWarningLevel > 0:
+                        return (attrWarningLevel,
+                                "%s: device %s of type %s did not pass attribute check: %s"
+                                % (('CRITICAL' if attrWarningLevel >= 2 else 'WARNING'),
+                                    device, devicetype, formatAttributeWarnings(attrCheckWarnings)))
+
         else:
 		if temperature == None:
 			temperature = "N/A"
-		return (0, "OK: device %s of type %s is functional and stable (temperature: %s C)" % ( device , devicetype, str(temperature)))
+		return (0, "OK: device %s of type %s is functional and stable (temperature: %s C)"
+                        % ( device , devicetype, str(temperature)))
 
         # fi
 # end
@@ -279,10 +349,11 @@ if __name__ == "__main__":
 		if value != 0:
 			exitWithMessage(3, message)
 		vprint(2, "Parse smartctl output")
-		(healthStatus, temperature) = parseOutput(Output)
+		(healthStatus, temperature, attrCheckWarnings) = parseOutput(Output, options)
 		vprint(2, "Generate return information")
 		(value, message) = createReturnInfo(device, devicetype, healthStatus, temperature,
-						    options.warningThreshold, options.criticalThreshold)
+						    options.warningThreshold, options.criticalThreshold,
+                                                    attrCheckWarnings)
 		if value > overallvalue:
 			overallvalue = value
 		full_message.append((value,message))
